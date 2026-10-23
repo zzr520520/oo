@@ -603,7 +603,7 @@ __attribute__((constructor)) static void HaiouMassHelperInit() {
         if (mineCls) {
             Method m = class_getInstanceMethod(mineCls, @selector(viewDidAppear:));
             if (m) {
-                orig_MineVC_viewDidAppear = (void *)method_getImplementation(m);
+                orig_MineVC_viewDidAppear = (__typeof__(orig_MineVC_viewDidAppear))method_getImplementation(m);
                 method_setImplementation(m, (IMP)hook_MineVC_viewDidAppear);
             }
         }
@@ -613,12 +613,12 @@ __attribute__((constructor)) static void HaiouMassHelperInit() {
         if (rankCls) {
             Method mLoad = class_getInstanceMethod(rankCls, @selector(viewDidLoad));
             if (mLoad) {
-                orig_RankVC_viewDidLoad = (void *)method_getImplementation(mLoad);
+                orig_RankVC_viewDidLoad = (__typeof__(orig_RankVC_viewDidLoad))method_getImplementation(mLoad);
                 method_setImplementation(mLoad, (IMP)hook_RankVC_viewDidLoad);
             }
             Method mCell = class_getInstanceMethod(rankCls, @selector(tableView:cellForRowAtIndexPath:));
             if (mCell) {
-                orig_RankVC_cellForRow = (void *)method_getImplementation(mCell);
+                orig_RankVC_cellForRow = (__typeof__(orig_RankVC_cellForRow))method_getImplementation(mCell);
                 method_setImplementation(mCell, (IMP)hook_RankVC_cellForRow);
             }
         }
@@ -628,7 +628,7 @@ __attribute__((constructor)) static void HaiouMassHelperInit() {
         if (groupMemberCls) {
             Method mAppear = class_getInstanceMethod(groupMemberCls, @selector(viewDidAppear:));
             if (mAppear) {
-                orig_GroupMemberVC_viewDidAppear = (void *)method_getImplementation(mAppear);
+                orig_GroupMemberVC_viewDidAppear = (__typeof__(orig_GroupMemberVC_viewDidAppear))method_getImplementation(mAppear);
                 method_setImplementation(mAppear, (IMP)hook_GroupMemberVC_viewDidAppear);
             }
         }
