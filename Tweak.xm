@@ -18,6 +18,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic, copy) NSString *detail;
 @property (nonatomic, assign) HOMassTargetType type;
+@property (nonatomic, assign) BOOL isFriend; // 是否为已通过的好友
 @property (nonatomic, strong) id rawModel;
 @end
 
@@ -25,7 +26,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 @end
 
 // ==========================================
-// 2. 深度内存递归与数据库采集引擎
+// 2. 数据与操作引擎
 // ==========================================
 @interface HOMassDataManager : NSObject
 @property (nonatomic, strong) NSMutableArray<HOMassTargetItem *> *friendsList;
@@ -35,7 +36,8 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 
 + (instancetype)shared;
 - (void)manualRefreshAllData:(void(^)(NSString *summary))completion;
-- (void)sendMassMessage:(NSString *)text toTargets:(NSArray<HOMassTargetItem *> *)targets interval:(NSTimeInterval)interval progress:(void(^)(NSInteger current, NSInteger total))progress completion:(void(^)(NSInteger sentCount))completion;
+- (void)sendFriendRequestsToTargets:(NSArray<HOMassTargetItem *> *)targets reason:(NSString *)reason progress:(void(^)(NSInteger current, NSInteger total))progress completion:(void(^)(NSInteger successCount))completion;
+- (void)sendMassMessage:(NSString *)text toTargets:(NSArray<HOMassTargetItem *> *)targets onlyFriends:(BOOL)onlyFriends interval:(NSTimeInterval)interval progress:(void(^)(NSInteger current, NSInteger total))progress completion:(void(^)(NSInteger sentCount))completion;
 @end
 
 @implementation HOMassDataManager
@@ -53,117 +55,6 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
     return instance;
 }
 
-// 递归遍历对象的所有实例变量（Ivars），寻找隐藏的数组或字典缓存
-- (void)recursiveExtractObjectsFrom:(id)obj visited:(NSMutableSet *)visited depth:(int)depth {
-    if (!obj || depth > 3 || [visited containsObject:@((long)obj)]) return;
-    [visited addObject:@((long)obj)];
-    
-    if ([obj isKindOfClass:[NSArray class]]) {
-        for (id sub in (NSArray *)obj) {
-            [self classifyAndStoreObject:sub];
-            [self recursiveExtractObjectsFrom:sub visited:visited depth:depth + 1];
-        }
-        return;
-    }
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        for (id key in [(NSDictionary *)obj allValues]) {
-            [self classifyAndStoreObject:key];
-            [self recursiveExtractObjectsFrom:key visited:visited depth:depth + 1];
-        }
-        return;
-    }
-    
-    Class cls = [obj class];
-    while (cls && cls != [NSObject class]) {
-        unsigned int count = 0;
-        Ivar *ivars = class_copyIvarList(cls, &count);
-        for (unsigned int i = 0; i < count; i++) {
-            const char *type = ivar_getTypeEncoding(ivars[i]);
-            if (type && type[0] == '@') {
-                id val = object_getIvar(obj, ivars[i]);
-                if (val) {
-                    [self classifyAndStoreObject:val];
-                    if ([val isKindOfClass:[NSArray class]] || [val isKindOfClass:[NSDictionary class]] || [NSStringFromClass([val class]) containsString:@"ZD"]) {
-                        [self recursiveExtractObjectsFrom:val visited:visited depth:depth + 1];
-                    }
-                }
-            }
-        }
-        free(ivars);
-        cls = class_getSuperclass(cls);
-    }
-}
-
-// 自动识别并分类存储对象特征
-- (void)classifyAndStoreObject:(id)obj {
-    if (!obj || ![obj isKindOfClass:[NSObject class]]) return;
-    
-    NSString *clsName = NSStringFromClass([obj class]);
-    // 检查是否包含关键业务字段
-    NSString *uId = [self safeStringFromObj:obj keys:@[@"userId", @"id", @"chatId", @"account", @"userNo"]];
-    NSString *uName = [self safeStringFromObj:obj keys:@[@"nickName", @"name", @"showName", @"userName", @"mark"]];
-    
-    if (uId.length == 0 || [uId isEqualToString:@"0"]) return;
-    
-    // 判断类型
-    BOOL isGroup = [clsName containsString:@"Group"] || [self safeBoolFromObj:obj key:@"isGroup"];
-    BOOL isMember = [clsName containsString:@"Member"] || [self safeStringFromObj:obj keys:@[@"groupId"]] != nil;
-    BOOL isRank = [clsName containsString:@"Rank"] || [clsName containsString:@"Top"] || [self safeStringFromObj:obj keys:@[@"ranking", @"grade"]] != nil;
-    
-    HOMassTargetItem *item = [HOMassTargetItem new];
-    item.targetId = uId;
-    item.name = uName.length > 0 ? uName : [NSString stringWithFormat:@"用户_%@", [uId substringFromIndex:MAX(0, (int)uId.length - 4)]];
-    item.rawModel = obj;
-    
-    if (isRank) {
-        item.type = HOMassTargetTypeRankUser;
-        item.detail = [NSString stringWithFormat:@"等级排行榜 ID: %@", uId];
-        [self addUniqueItem:item toList:self.rankUsersList];
-    } else if (isMember) {
-        item.type = HOMassTargetTypeGroupMember;
-        item.detail = [NSString stringWithFormat:@"群成员 ID: %@", uId];
-        [self addUniqueItem:item toList:self.groupMembersList];
-    } else if (isGroup) {
-        item.type = HOMassTargetTypeGroup;
-        item.detail = [NSString stringWithFormat:@"群聊 ID: %@", uId];
-        [self addUniqueItem:item toList:self.groupsList];
-    } else {
-        item.type = HOMassTargetTypeFriend;
-        item.detail = [NSString stringWithFormat:@"好友 ID: %@", uId];
-        [self addUniqueItem:item toList:self.friendsList];
-    }
-}
-
-- (void)addUniqueItem:(HOMassTargetItem *)item toList:(NSMutableArray *)list {
-    for (HOMassTargetItem *exist in list) {
-        if ([exist.targetId isEqualToString:item.targetId]) return;
-    }
-    [list addObject:item];
-}
-
-- (NSString *)safeStringFromObj:(id)obj keys:(NSArray<NSString *> *)keys {
-    for (NSString *key in keys) {
-        @try {
-            id val = [obj valueForKey:key];
-            if (val && [val isEqual:[NSNull null]] == NO) {
-                NSString *str = [NSString stringWithFormat:@"%@", val];
-                if (str.length > 0) return str;
-            }
-        } @catch (NSException *e) {}
-    }
-    return nil;
-}
-
-- (BOOL)safeBoolFromObj:(id)obj key:(NSString *)key {
-    @try {
-        id val = [obj valueForKey:key];
-        return [val boolValue];
-    } @catch (NSException *e) {
-        return NO;
-    }
-}
-
-// 主动刷新：全面深度内存扫描 + SQLite 沙盒读取
 - (void)manualRefreshAllData:(void(^)(NSString *summary))completion {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         [self.friendsList removeAllObjects];
@@ -171,14 +62,9 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
         [self.groupMembersList removeAllObjects];
         [self.rankUsersList removeAllObjects];
         
-        // 1. 深度遍历当前所有窗口与活跃控制器
-        NSArray *windows = [UIApplication sharedApplication].windows;
-        NSMutableSet *visited = [NSMutableSet set];
-        for (UIWindow *win in windows) {
-            [self recursiveExtractObjectsFrom:win.rootViewController visited:visited depth:0];
-        }
+        NSMutableSet *addedIds = [NSMutableSet set];
         
-        // 2. 本地沙盒 SQLite 数据库深度检索兜底
+        // 扫描沙盒 SQLite 数据库
         NSString *docDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
         NSString *libDir = [docDir stringByDeletingLastPathComponent];
         NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtPath:libDir];
@@ -195,29 +81,40 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
                             if (!tNameC) continue;
                             NSString *tName = [NSString stringWithUTF8String:tNameC];
                             
-                            NSString *query = [NSString stringWithFormat:@"SELECT * FROM %@ LIMIT 500;", tName];
+                            NSString *query = [NSString stringWithFormat:@"SELECT * %@ LIMIT 1500;", tName];
+                            // 优化 SQL 容错
+                            NSString *safeQuery = [NSString stringWithFormat:@"SELECT * FROM %@ LIMIT 1000;", tName];
                             sqlite3_stmt *qStmt = NULL;
-                            if (sqlite3_prepare_v2(db, [query UTF8String], -1, &qStmt, NULL) == SQLITE_OK) {
+                            if (sqlite3_prepare_v2(db, [safeQuery UTF8String], -1, &qStmt, NULL) == SQLITE_OK) {
                                 int colCount = sqlite3_column_count(qStmt);
                                 while (sqlite3_step(qStmt) == SQLITE_ROW) {
                                     NSString *uId = @"";
                                     NSString *uName = @"";
+                                    BOOL isFriendFlag = YES; // 默认数据库里的多为好友或会话
+                                    
                                     for (int c = 0; c < colCount; c++) {
                                         const char *cnC = sqlite3_column_name(qStmt, c);
                                         const char *cvC = (const char *)sqlite3_column_text(qStmt, c);
                                         if (!cnC || !cvC) continue;
                                         NSString *cn = [[NSString stringWithUTF8String:cnC] lowercaseString];
                                         NSString *cv = [NSString stringWithUTF8String:cvC];
-                                        if ([cn containsString:@"id"] && uId.length == 0) uId = cv;
-                                        if (([cn containsString:@"name"] || [cn containsString:@"nick"]) && uName.length == 0) uName = cv;
+                                        
+                                        if (([cn containsString:@"id"] || [cn isEqualToString:@"uid"]) && uId.length == 0) uId = cv;
+                                        if (([cn containsString:@"name"] || [cn containsString:@"nick"] || [cn containsString:@"title"]) && uName.length == 0) uName = cv;
+                                        if ([cn containsString:@"relation"] || [cn containsString:@"status"]) {
+                                            if ([cv intValue] == 0) isFriendFlag = NO;
+                                        }
                                     }
-                                    if (uId.length > 0) {
+                                    
+                                    if (uId.length > 0 && ![addedIds containsObject:uId]) {
+                                        [addedIds addObject:uId];
                                         HOMassTargetItem *item = [HOMassTargetItem new];
                                         item.targetId = uId;
-                                        item.name = uName.length > 0 ? uName : [NSString stringWithFormat:@"缓存用户_%@", uId];
-                                        item.detail = [NSString stringWithFormat:@"本地数据库同步 ID: %@", uId];
+                                        item.name = (uName.length > 0 && ![uName isEqualToString:uId]) ? uName : [NSString stringWithFormat:@"用户_%@", [uId substringFromIndex:MAX(0, (int)uId.length - 6)]];
+                                        item.detail = [NSString stringWithFormat:@"好友ID: %@", uId];
                                         item.type = HOMassTargetTypeFriend;
-                                        [self addUniqueItem:item toList:self.friendsList];
+                                        item.isFriend = isFriendFlag;
+                                        [self.friendsList addObject:item];
                                     }
                                 }
                                 sqlite3_finalize(qStmt);
@@ -241,8 +138,59 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
     });
 }
 
-// 消息群发底层调用修正：直接利用海鸥的 UIAction 或消息投递队列
-- (void)sendMassMessage:(NSString *)text toTargets:(NSArray<HOMassTargetItem *> *)targets interval:(NSTimeInterval)interval progress:(void(^)(NSInteger current, NSInteger total))progress completion:(void(^)(NSInteger sentCount))completion {
+// 批量发送好友申请
+- (void)sendFriendRequestsToTargets:(NSArray<HOMassTargetItem *> *)targets reason:(NSString *)reason progress:(void(^)(NSInteger current, NSInteger total))progress completion:(void(^)(NSInteger successCount))completion {
+    if (targets.count == 0) {
+        if (completion) completion(0);
+        return;
+    }
+    
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSInteger success = 0;
+        Class contactMgrClass = objc_getClass("_TtC7ZhengDu17ZDContactManager") ?: objc_getClass("ZhengDu.ZDContactManager");
+        
+        for (HOMassTargetItem *t in targets) {
+            @try {
+                // 尝试通过系统反射调用添加好友接口
+                SEL sharedSel = NSSelectorFromString(@"shared") ?: NSSelectorFromString(@"sharedInstance");
+                if ([contactMgrClass respondsToSelector:sharedSel]) {
+                    id mgr = ((id (*)(id, SEL))objc_msgSend)(contactMgrClass, sharedSel);
+                    unsigned int count = 0;
+                    Method *methods = class_copyMethodList([mgr class], &count);
+                    for (unsigned int i = 0; i < count; i++) {
+                        NSString *s = NSStringFromSelector(method_getName(methods[i]));
+                        if ([s containsString:@"add"] && ([s containsString:@"Friend"] || [s containsString:@"Contact"] || [s containsString:@"User"])) {
+                            SEL addSel = method_getName(methods[i]);
+                            NSMethodSignature *sig = [mgr methodSignatureForSelector:addSel];
+                            if (sig.numberOfArguments >= 3) {
+                                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                                [inv setTarget:mgr];
+                                [inv setSelector:addSel];
+                                [inv setArgument:&t.targetId atIndex:2];
+                                [inv invoke];
+                                break;
+                            }
+                        }
+                    }
+                    free(methods);
+                }
+                success++;
+            } @catch (NSException *e) {}
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (progress) progress(success, targets.count);
+            });
+            [NSThread sleepForTimeInterval:0.6];
+        }
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(success);
+        });
+    });
+}
+
+// 带好友白名单过滤的群发
+- (void)sendMassMessage:(NSString *)text toTargets:(NSArray<HOMassTargetItem *> *)targets onlyFriends:(BOOL)onlyFriends interval:(NSTimeInterval)interval progress:(void(^)(NSInteger current, NSInteger total))progress completion:(void(^)(NSInteger sentCount))completion {
     if (text.length == 0 || targets.count == 0) {
         if (completion) completion(0);
         return;
@@ -254,6 +202,11 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
         Class msgMgrClass = objc_getClass("_TtC7ZhengDu16ZDMessageManager") ?: objc_getClass("ZhengDu.ZDMessageManager");
         
         for (HOMassTargetItem *t in targets) {
+            // 如果开启了“仅限通讯录好友”，且该目标标记为非好友，则跳过
+            if (onlyFriends && t.type == HOMassTargetTypeFriend && !t.isFriend) {
+                continue;
+            }
+            
             @try {
                 id msgObj = [[msgClass alloc] init];
                 if (msgObj) {
@@ -264,16 +217,13 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
                     [msgObj setValue:@(t.type == HOMassTargetTypeGroup ? 2 : 1) forKey:@"messageType"];
                 }
                 
-                // 尝试单例投递
                 SEL sharedSel = NSSelectorFromString(@"shared") ?: NSSelectorFromString(@"sharedInstance");
                 if ([msgMgrClass respondsToSelector:sharedSel]) {
                     id mgr = ((id (*)(id, SEL))objc_msgSend)(msgMgrClass, sharedSel);
                     [mgr setValue:@(YES) forKey:@"isGroupSend"];
                     
-                    // 动态调用发送方法
                     unsigned int count = 0;
                     Method *methods = class_copyMethodList([mgr class], &count);
-                    BOOL invoked = NO;
                     for (unsigned int i = 0; i < count; i++) {
                         NSString *s = NSStringFromSelector(method_getName(methods[i]));
                         if ([s containsString:@"send"] && ([s containsString:@"Msg"] || [s containsString:@"Message"])) {
@@ -285,16 +235,11 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
                                 [inv setSelector:sendSel];
                                 [inv setArgument:&msgObj atIndex:2];
                                 [inv invoke];
-                                invoked = YES;
                                 break;
                             }
                         }
                     }
                     free(methods);
-                    if (!invoked && msgObj) {
-                        // 备用兜底通知
-                        [[NSNotificationCenter defaultCenter] postNotificationName:@"ZD_SendMassMessageNotification" object:msgObj];
-                    }
                 }
                 sent++;
             } @catch (NSException *e) {}
@@ -302,7 +247,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (progress) progress(sent, targets.count);
             });
-            [NSThread sleepForTimeInterval:MAX(interval, 0.4)];
+            [NSThread sleepForTimeInterval:MAX(interval, 0.5)];
         }
         
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -313,12 +258,13 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 @end
 
 // ==========================================
-// 3. 群发助手面板 UI
+// 3. UI 控制面板
 // ==========================================
 @interface HOMassAssistantController : UIViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UISegmentedControl *segment;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UITextField *inputField;
+@property (nonatomic, strong) UISwitch *friendSwitch; // 仅向通讯录好友群发开关
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) NSMutableArray<HOMassTargetItem *> *currentShowList;
 @property (nonatomic, strong) NSMutableSet<NSString *> *selectedIds;
@@ -328,7 +274,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"群发助手";
+    self.title = @"群发与好友助手";
     self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
     self.selectedIds = [NSMutableSet set];
     self.currentShowList = [NSMutableArray array];
@@ -341,7 +287,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 - (void)setupNavBar {
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(dismissSelf)];
     
-    UIBarButtonItem *refreshItem = [[UIBarButtonItem alloc] initWithTitle:@"🔄 刷新获取" style:UIBarButtonItemStyleDone target:self action:@selector(doRefreshData)];
+    UIBarButtonItem *refreshItem = [[UIBarButtonItem alloc] initWithTitle:@"🔄 刷新" style:UIBarButtonItemStyleDone target:self action:@selector(doRefreshData)];
     UIBarButtonItem *selectAllItem = [[UIBarButtonItem alloc] initWithTitle:@"全选" style:UIBarButtonItemStylePlain target:self action:@selector(selectAllTargets)];
     UIBarButtonItem *invertItem = [[UIBarButtonItem alloc] initWithTitle:@"反选" style:UIBarButtonItemStylePlain target:self action:@selector(invertTargets)];
     self.navigationItem.rightBarButtonItems = @[refreshItem, selectAllItem, invertItem];
@@ -354,7 +300,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
     [self.segment addTarget:self action:@selector(tabChanged:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.segment];
     
-    CGFloat bottomH = 110;
+    CGFloat bottomH = 150;
     self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, 146, self.view.bounds.size.width, self.view.bounds.size.height - 146 - bottomH) style:UITableViewStylePlain];
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
@@ -367,18 +313,40 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
     self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 6, self.view.bounds.size.width - 32, 20)];
     self.statusLabel.font = [UIFont systemFontOfSize:12];
     self.statusLabel.textColor = [UIColor secondaryLabelColor];
-    self.statusLabel.text = @"就绪：点击右上角【🔄 刷新获取】";
+    self.statusLabel.text = @"就绪：请勾选目标并选择操作";
     [bottomBar addSubview:self.statusLabel];
     
-    self.inputField = [[UITextField alloc] initWithFrame:CGRectMake(16, 32, self.view.bounds.size.width - 116, 40)];
+    // 仅通讯录好友白名单开关
+    UILabel *switchLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 32, 160, 24)];
+    switchLabel.font = [UIFont systemFontOfSize:13];
+    switchLabel.text = @"仅向通讯录好友群发:";
+    [bottomBar addSubview:switchLabel];
+    
+    self.friendSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(176, 30, 50, 24)];
+    self.friendSwitch.on = YES;
+    [bottomBar addSubview:self.friendSwitch];
+    
+    // 批量添加好友申请按钮
+    UIButton *addBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    addBtn.frame = CGRectMake(self.view.bounds.size.width - 170, 30, 74, 30);
+    addBtn.backgroundColor = [UIColor systemOrangeColor];
+    [addBtn setTitle:@"加好友" forState:UIControlStateNormal];
+    [addBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    addBtn.layer.cornerRadius = 6;
+    [addBtn addTarget:self action:@selector(startAddFriends) forControlEvents:UIControlEventTouchUpInside];
+    [bottomBar addSubview:addBtn];
+    
+    // 群发输入框
+    self.inputField = [[UITextField alloc] initWithFrame:CGRectMake(16, 70, self.view.bounds.size.width - 116, 40)];
     self.inputField.borderStyle = UITextBorderStyleRoundedRect;
     self.inputField.placeholder = @"输入要群发的内容...";
     [bottomBar addSubview:self.inputField];
     
+    // 群发按钮
     UIButton *sendBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    sendBtn.frame = CGRectMake(self.view.bounds.size.width - 90, 32, 74, 40);
+    sendBtn.frame = CGRectMake(self.view.bounds.size.width - 90, 70, 74, 40);
     sendBtn.backgroundColor = [UIColor systemBlueColor];
-    [sendBtn setTitle:@"开始群发" forState:UIControlStateNormal];
+    [sendBtn setTitle:@"发消息" forState:UIControlStateNormal];
     [sendBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     sendBtn.layer.cornerRadius = 6;
     [sendBtn addTarget:self action:@selector(startSending) forControlEvents:UIControlEventTouchUpInside];
@@ -390,7 +358,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 }
 
 - (void)doRefreshData {
-    self.statusLabel.text = @"⏳ 正在深度扫描内存与数据库...";
+    self.statusLabel.text = @"⏳ 正在刷新本地缓存...";
     [[HOMassDataManager shared] manualRefreshAllData:^(NSString *summary) {
         self.statusLabel.text = summary;
         [self switchTab:self.segment.selectedSegmentIndex];
@@ -431,6 +399,32 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
     self.statusLabel.text = [NSString stringWithFormat:@"已选中 %lu 个目标", (unsigned long)self.selectedIds.count];
 }
 
+- (void)startAddFriends {
+    [self.view endEditing:YES];
+    NSMutableArray *targets = [NSMutableArray array];
+    HOMassDataManager *mgr = [HOMassDataManager shared];
+    NSArray *pools = @[mgr.friendsList, mgr.groupsList, mgr.groupMembersList, mgr.rankUsersList];
+    for (NSArray *pool in pools) {
+        for (HOMassTargetItem *it in pool) {
+            if ([self.selectedIds containsObject:it.targetId]) {
+                [targets addObject:it];
+            }
+        }
+    }
+    
+    if (targets.count == 0) {
+        self.statusLabel.text = @"⚠️ 请先勾选要发送好友申请的目标！";
+        return;
+    }
+    
+    self.statusLabel.text = [NSString stringWithFormat:@"📤 正在发送申请 (0/%lu)...", (unsigned long)targets.count];
+    [[HOMassDataManager shared] sendFriendRequestsToTargets:targets reason:@"你好" progress:^(NSInteger current, NSInteger total) {
+        self.statusLabel.text = [NSString stringWithFormat:@"📤 正在发送申请 (%ld/%ld)...", (long)current, (long)total];
+    } completion:^(NSInteger successCount) {
+        self.statusLabel.text = [NSString stringWithFormat:@"✅ 申请发送完毕！成功 %ld 项", (long)successCount];
+    }];
+}
+
 - (void)startSending {
     [self.view endEditing:YES];
     NSString *text = self.inputField.text;
@@ -455,11 +449,12 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
         return;
     }
     
-    self.statusLabel.text = [NSString stringWithFormat:@"🚀 开始发送 (0/%lu)...", (unsigned long)targets.count];
-    [[HOMassDataManager shared] sendMassMessage:text toTargets:targets interval:0.5 progress:^(NSInteger current, NSInteger total) {
-        self.statusLabel.text = [NSString stringWithFormat:@"🚀 正在发送 (%ld/%ld)...", (long)current, (long)total];
+    BOOL onlyFriends = self.friendSwitch.isOn;
+    self.statusLabel.text = [NSString stringWithFormat:@"🚀 开始群发 (0/%lu)...", (unsigned long)targets.count];
+    [[HOMassDataManager shared] sendMassMessage:text toTargets:targets onlyFriends:onlyFriends interval:0.6 progress:^(NSInteger current, NSInteger total) {
+        self.statusLabel.text = [NSString stringWithFormat:@"🚀 正在群发 (%ld/%ld)...", (long)current, (long)total];
     } completion:^(NSInteger sentCount) {
-        self.statusLabel.text = [NSString stringWithFormat:@"✅ 群发完毕！成功投递 %ld 项", (long)sentCount];
+        self.statusLabel.text = [NSString stringWithFormat:@"✅ 群发完成！有效送达 %ld 项", (long)sentCount];
     }];
 }
 
@@ -496,7 +491,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 @end
 
 // ==========================================
-// 4. Hook “我的”页面底部注入
+// 4. Hook 注入入口
 // ==========================================
 static NSInteger (*orig_numberOfRows)(id self, SEL _cmd, UITableView *tableView, NSInteger section) = NULL;
 static NSInteger hook_numberOfRows(id self, SEL _cmd, UITableView *tableView, NSInteger section) {
@@ -521,7 +516,7 @@ static UITableViewCell* hook_cellForRow(id self, SEL _cmd, UITableView *tableVie
                 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
                 cell.textLabel.font = [UIFont systemFontOfSize:15];
             }
-            cell.textLabel.text = @"群发助手";
+            cell.textLabel.text = @"群发与好友助手";
             cell.imageView.image = [UIImage systemImageNamed:@"paperplane.fill"] ?: [UIImage systemImageNamed:@"message.fill"];
             cell.imageView.tintColor = [UIColor systemBlueColor];
             return cell;
@@ -549,9 +544,6 @@ static void hook_didSelectRow(id self, SEL _cmd, UITableView *tableView, NSIndex
     }
 }
 
-// ==========================================
-// 5. 初始化
-// ==========================================
 __attribute__((constructor)) static void InitHaiouMassHook() {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         Class mineCls = objc_getClass("_TtC7ZhengDu16ZDMineController") ?: objc_getClass("ZhengDu.ZDMineController");
