@@ -303,7 +303,7 @@
             
             if ([title isEqualToString:@"群发助手"]) {
                 ZDGBroadcastViewController *vc = [[ZDGBroadcastViewController alloc] init];
-                [((id)self).navigationController pushViewController:vc animated:YES];
+                [[(id)self navigationController] pushViewController:vc animated:YES];
                 return;
             }
         }

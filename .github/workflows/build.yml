@@ -268,11 +268,23 @@ jobs:
                       j += 1
                   if cls not in declared:
                       for k in range(i, j+1):
-                          # 点语法：self.foo -> ((id)self).foo（(id) 只作用于 self）
-                          lines[k], n1 = re.subn(r'\[self\.', '[((id)self).', lines[k])
+                          # 点语法：self.foo -> [[(id)self foo]（(id) 转换后不能再走点语法，
+                          # 否则报 "property 'foo' not found on object of type 'id'"）。
+                          def _dot(line):
+                              pat = re.compile(r'\[\s*(?:\(\(id\)self\)|self)\.(\w+)\s*([^\]]*)\]')
+                              for _ in range(5):
+                                  line, n = pat.subn(
+                                      lambda m: '[[(id)self %s]%s]' % (
+                                          m.group(1),
+                                          (' ' + m.group(2).strip()) if m.group(2).strip() else ''
+                                      ), line)
+                                  if not n:
+                                      break
+                              return line
+                          lines[k] = _dot(lines[k])
                           # 消息语法：self -> (id)self
                           lines[k], n2 = re.subn(r'\[self(?=[ \]])', '[(id)self', lines[k])
-                          count += n1 + n2
+                          count += n2
                   i = j + 1
               else:
                   i += 1
