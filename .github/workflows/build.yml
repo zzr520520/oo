@@ -1,0 +1,61 @@
+name: Build Tweak
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      THEOS: /Users/runner/theos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos and iOS SDK
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
+          mkdir -p "$THEOS/sdks"
+          cp -R /tmp/sdks/iPhoneOS*.sdk "$THEOS/sdks/"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+          ls -1 "$THEOS/sdks"
+
+      - name: Install ldid / dpkg
+        run: |
+          brew install ldid dpkg || brew install ldid || true
+          which ldid || true
+          which dpkg-deb || true
+
+      - name: Build dylib
+        run: make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Package deb
+        run: make package FINALPACKAGE=1
+
+      - name: Inspect build output
+        if: always()
+        run: |
+          find .theos/obj -name '*.dylib' -exec file {} \; || true
+          ls -l packages/ || true
+
+      - name: Upload dylib
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oo-dylib
+          path: .theos/obj/**/*.dylib
+          if-no-files-found: warn
+
+      - name: Upload deb
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oo-deb
+          path: packages/*.deb
+          if-no-files-found: ignore

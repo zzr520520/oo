@@ -1,0 +1,9 @@
+Package: com.zzr520520.oo
+Name: oo
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: oo tweak built from Tweak.xm
+Maintainer: zzr520520
+Author: zzr520520
+Section: Tweaks
+Depends: mobilesubstrate
