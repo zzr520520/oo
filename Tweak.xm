@@ -166,7 +166,8 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
                                 NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
                                 [inv setTarget:mgr];
                                 [inv setSelector:addSel];
-                                [inv setArgument:&t.targetId atIndex:2];
+                                NSString *tidArg = t.targetId;
+                                [inv setArgument:&tidArg atIndex:2];
                                 [inv invoke];
                                 break;
                             }

@@ -87,6 +87,38 @@ jobs:
           print("fixed stray star in", n, "method declaration(s)")
           PY
 
+      - name: Fix address-of property expressions
+        run: |
+          # 形如 "&obj.prop" 的写法在 ObjC 中非法（编译器报
+          # "address of property expression requested"）。此处自动改为
+          # 先赋给临时变量再取地址（幂等，仅匹配独立的 obj.prop）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          src = p.read_text()
+          pat = re.compile(r'&([A-Za-z_]\w*)\.([A-Za-z_]\w*)(?=[\s\];,)])')
+          count = 0
+          def fix_line(line):
+              global count
+              ms = list(pat.finditer(line))
+              if not ms:
+                  return line
+              parts, prefix, last = [], "", 0
+              for m in ms:
+                  count += 1
+                  name = "__argtmp_%d" % count
+                  prefix += "__auto_type %s = %s.%s; " % (name, m.group(1), m.group(2))
+                  parts.append(line[last:m.start()])
+                  parts.append("&" + name)
+                  last = m.end()
+              parts.append(line[last:])
+              return prefix + "".join(parts)
+          new = "\n".join(fix_line(l) for l in src.split("\n"))
+          if count:
+              p.write_text(new)
+          print("fixed", count, "address-of property expression(s)")
+          PY
+
       - name: Build dylib
         run: make -j"$(sysctl -n hw.ncpu)"
 
