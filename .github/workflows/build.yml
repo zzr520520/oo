@@ -47,6 +47,32 @@ jobs:
           print("rewrote", n)
           PY
 
+      - name: Ensure NSString altName declaration
+        run: |
+          # altName: 的实现位于文件后部，而调用点可能在其之前，
+          # 会报 "no known class method for selector 'altName:'"。
+          # 若源码缺少前置声明则自动补上（幂等，仅在缺失时插入）。
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          if "altName:" in s and "@interface NSString (HOExt)" not in s:
+              decl = ("\n// 前置声明：altName: 实现在文件后部，避免调用点在定义之前。\n"
+                      "@interface NSString (HOExt)\n"
+                      "+ (NSString *)altName:(NSString *)uid;\n"
+                      "@end\n")
+              lines = s.split("\n")
+              idx = 0
+              for i, ln in enumerate(lines):
+                  if ln.lstrip().startswith("#import"):
+                      idx = i + 1
+              lines.insert(idx, decl)
+              p.write_text("\n".join(lines))
+              print("inserted altName declaration")
+          else:
+              print("altName declaration present or not needed")
+          PY
+
       - name: Build dylib
         run: make -j"$(sysctl -n hw.ncpu)"
 

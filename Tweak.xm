@@ -3,6 +3,12 @@
 #import <objc/message.h>
 #import <sqlite3.h>
 
+// 前置声明：altName: 的实现在文件后部，此处提前声明，避免调用点在定义之前时的
+// "no known class method for selector 'altName:'" 编译错误。
+@interface NSString (HOExt)
++ (NSString *)altName:(NSString *)uid;
+@end
+
 // ==========================================
 // 1. 数据模型与分类定义
 // ==========================================
