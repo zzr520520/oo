@@ -17,6 +17,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Normalize source filename
+        run: |
+          # Makefile 固定引用 Tweak.xm；若上传的源文件名大小写不同
+          # （例如 tweak.xm），Theos 生成的编译规则会找不到源文件。
+          # 这里统一改名为 Tweak.xm（保留仓库中唯一的 .xm 文件）。
+          echo "--- before ---"
+          ls -la
+          shopt -s nullglob
+          for f in *.xm; do
+            if [ "$f" != "Tweak.xm" ]; then
+              mv -- "$f" Tweak.xm
+              echo "renamed '$f' -> 'Tweak.xm'"
+            fi
+          done
+          echo "--- after ---"
+          ls -la *.xm
+
       - name: Install Theos and iOS SDK
         run: |
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
