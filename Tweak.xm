@@ -54,7 +54,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 }
 
 // 递归遍历对象的所有实例变量（Ivars），寻找隐藏的数组或字典缓存
-- * (void)recursiveExtractObjectsFrom:(id)obj visited:(NSMutableSet *)visited depth:(int)depth {
+- (void)recursiveExtractObjectsFrom:(id)obj visited:(NSMutableSet *)visited depth:(int)depth {
     if (!obj || depth > 3 || [visited containsObject:@((long)obj)]) return;
     [visited addObject:@((long)obj)];
     

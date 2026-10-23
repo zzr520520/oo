@@ -73,6 +73,20 @@ jobs:
               print("altName declaration present or not needed")
           PY
 
+      - name: Fix stray '*' in method declarations
+        run: |
+          # 源码中形如 "- * (void)foo" 的写法是非法语法（多了一个 *），
+          # 会导致编译错误。此处规范化为 "- (void)foo"（幂等）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          new, n = re.subn(r'(?m)^([ \t]*[-+][ \t]*)\*[ \t]*(?=\()', r'\1', s)
+          if n:
+              p.write_text(new)
+          print("fixed stray star in", n, "method declaration(s)")
+          PY
+
       - name: Build dylib
         run: make -j"$(sysctl -n hw.ncpu)"
 
