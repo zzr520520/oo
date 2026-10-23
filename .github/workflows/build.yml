@@ -19,20 +19,21 @@ jobs:
 
       - name: Normalize source filename
         run: |
-          # Makefile 固定引用 Tweak.xm；若上传的源文件名大小写不同
-          # （例如 tweak.xm），Theos 生成的编译规则会找不到源文件。
-          # 这里统一改名为 Tweak.xm（保留仓库中唯一的 .xm 文件）。
+          # Makefile 固定引用 Tweak.xm；上传的源文件可能叫 tweak.xm / 其它名字，
+          # 甚至是 .m / .mm 后缀。这里统一改名为 Tweak.xm（Logos 对纯 ObjC 文件也兼容）。
           echo "--- before ---"
           ls -la
           shopt -s nullglob
-          for f in *.xm; do
-            if [ "$f" != "Tweak.xm" ]; then
-              mv -- "$f" Tweak.xm
-              echo "renamed '$f' -> 'Tweak.xm'"
-            fi
+          target=""
+          for f in Tweak.xm tweak.xm *.xm *.x *.mm *.m; do
+            if [ -f "$f" ]; then target="$f"; break; fi
           done
+          if [ -n "$target" ] && [ "$target" != "Tweak.xm" ]; then
+            mv -- "$target" Tweak.xm
+            echo "renamed '$target' -> 'Tweak.xm'"
+          fi
           echo "--- after ---"
-          ls -la *.xm
+          ls -la Tweak.xm
 
       - name: Install Theos and iOS SDK
         run: |
@@ -83,6 +84,22 @@ jobs:
           if n:
               p.write_text(new)
           print("rewrote", n)
+          PY
+
+      - name: Fix __bridge void* to typed C pointer casts
+        run: |
+          # ARC 下 "uint8_t *base = (__bridge void *)obj;" 在 ObjC++ 里是错误
+          # （void* 不能隐式转成具体指针），需要显式补上目标类型转换（幂等）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          new, n = re.subn(
+              r'(?m)^([ \t]*)([A-Za-z_]\w*(?:[ \t]*\*)+)[ \t]*([A-Za-z_]\w*)[ \t]*=[ \t]*\(__bridge void \*\)',
+              r'\1\2\3 = (\2)(__bridge void *)', s)
+          if n:
+              p.write_text(new)
+          print("fixed", n, "bridge-void cast(s)")
           PY
 
       - name: Ensure NSString altName declaration

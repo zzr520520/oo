@@ -38,19 +38,19 @@ static NSString *SafeReadSwiftString(id obj, NSString *key, ptrdiff_t offset) {
 
 static NSInteger SafeReadSwiftInt(id obj, ptrdiff_t offset) {
     if (!obj) return 0;
-    uint8_t *base = (__bridge void *)obj;
+    uint8_t *base = (uint8_t *)(__bridge void *)obj;
     return *(NSInteger *)(base + offset);
 }
 
 static void SafeWriteSwiftInt(id obj, ptrdiff_t offset, NSInteger val) {
     if (!obj) return;
-    uint8_t *base = (__bridge void *)obj;
+    uint8_t *base = (uint8_t *)(__bridge void *)obj;
     *(NSInteger *)(base + offset) = val;
 }
 
 static id SafeReadObjCObjectAtOffset(id obj, ptrdiff_t offset) {
     if (!obj) return nil;
-    uint8_t *base = (__bridge void *)obj;
+    uint8_t *base = (uint8_t *)(__bridge void *)obj;
     void *ptr = *(void **)(base + offset);
     if (!ptr) return nil;
     // 验证指针有效性
