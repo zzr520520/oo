@@ -524,19 +524,19 @@ __attribute__((constructor)) static void InitHaiouMassHook() {
         if (mineCls) {
             Method mRows = class_getInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:));
             if (mRows) {
-                orig_numberOfRows = (void *)method_getImplementation(mRows);
+                orig_numberOfRows = (__typeof__(orig_numberOfRows))method_getImplementation(mRows);
                 method_setImplementation(mRows, (IMP)hook_numberOfRows);
             }
             
             Method mCell = class_getInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:));
             if (mCell) {
-                orig_cellForRow = (void *)method_getImplementation(mCell);
+                orig_cellForRow = (__typeof__(orig_cellForRow))method_getImplementation(mCell);
                 method_setImplementation(mCell, (IMP)hook_cellForRow);
             }
             
             Method mSelect = class_getInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:));
             if (mSelect) {
-                orig_didSelectRow = (void *)method_getImplementation(mSelect);
+                orig_didSelectRow = (__typeof__(orig_didSelectRow))method_getImplementation(mSelect);
                 method_setImplementation(mSelect, (IMP)hook_didSelectRow);
             }
         }
