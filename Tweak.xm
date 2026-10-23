@@ -25,7 +25,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 @end
 
 // ==========================================
-// 2. 数据采集引擎 (支持 内存Ivar反射 + 本地SQLite直读)
+// 2. 数据采集引擎 (本地 SQLite 穿透 + 内存反射双保险)
 // ==========================================
 @interface HOMassDataManager : NSObject
 @property (nonatomic, strong) NSMutableArray<HOMassTargetItem *> *friendsList;
@@ -53,7 +53,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
     return instance;
 }
 
-// 核心：突破 Swift 属性没有 @objc 限制的底层 Ivar 反射读取方法
+// 安全读取 Swift/ObjC 对象的 Ivar 或属性
 - (id)getUnderlyingIvar:(NSString *)ivarName fromObject:(id)obj {
     if (!obj || !ivarName) return nil;
     SEL getter = NSSelectorFromString(ivarName);
@@ -88,7 +88,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
     return nil;
 }
 
-// 主动刷新：结合内存对象捕获 + 沙盒 SQLite 兜底数据库直读
+// 主动刷新：直接扫描沙盒中的 SQLite 数据库文件并提取本地缓存
 - (void)manualRefreshAllData:(void(^)(NSString *summary))completion {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         [self.friendsList removeAllObjects];
@@ -96,10 +96,89 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
         [self.groupMembersList removeAllObjects];
         [self.rankUsersList removeAllObjects];
         
-        NSMutableSet *addedFriendIds = [NSMutableSet set];
-        NSMutableSet *addedGroupIds = [NSMutableSet set];
+        NSMutableSet *addedIds = [NSMutableSet set];
         
-        // 1. 内存控制器扫描
+        // 1. 尝试从本地沙盒 SQLite 数据库中读取会话与用户表
+        NSString *docDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        NSString *libDir = [docDir stringByDeletingLastPathComponent];
+        
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:libDir];
+        NSMutableArray *dbPaths = [NSMutableArray array];
+        for (NSString *subPath in enumerator) {
+            if ([subPath.pathExtension isEqualToString:@"db"] || [subPath.pathExtension isEqualToString:@"sqlite"]) {
+                [dbPaths addObject:[libDir stringByAppendingPathComponent:subPath]];
+            }
+        }
+        
+        for (NSString *dbPath in dbPaths) {
+            sqlite3 *db = NULL;
+            if (sqlite3_open([dbPath UTF8String], &db) == SQLITE_OK) {
+                // 检索所有表名
+                const char *sql = "SELECT name FROM sqlite_master WHERE type='table';";
+                sqlite3_stmt *stmt = NULL;
+                if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+                    while (sqlite3_step(stmt) == SQLITE_ROW) {
+                        const char *tNameC = (const char *)sqlite3_column_text(stmt, 0);
+                        if (!tNameC) continue;
+                        NSString *tName = [NSString stringWithUTF8String:tNameC];
+                        
+                        // 针对可能包含好友、群、会话的表进行全量捞取
+                        if ([tName rangeOfString:@"user" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                            [tName rangeOfString:@"friend" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                            [tName rangeOfString:@"group" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                            [tName rangeOfString:@"chat" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                            [tName rangeOfString:@"recent" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                            
+                            NSString *query = [NSString stringWithFormat:@"SELECT * FROM %@ LIMIT 1000;", tName];
+                            sqlite3_stmt *qStmt = NULL;
+                            if (sqlite3_prepare_v2(db, [query UTF8String], -1, &qStmt, NULL) == SQLITE_OK) {
+                                int colCount = sqlite3_column_count(qStmt);
+                                while (sqlite3_step(qStmt) == SQLITE_ROW) {
+                                    NSString *uId = @"";
+                                    NSString *uName = @"";
+                                    BOOL isGroupFlag = NO;
+                                    
+                                    for (int c = 0; c < colCount; c++) {
+                                        const char *colNameC = sqlite3_column_name(qStmt, c);
+                                        const char *colValC = (const char *)sqlite3_column_text(qStmt, c);
+                                        if (!colNameC || !colValC) continue;
+                                        NSString *cName = [[NSString stringWithUTF8String:colNameC] lowercaseString];
+                                        NSString *cVal = [NSString stringWithUTF8String:colValC];
+                                        
+                                        if ([cName containsString:@"id"] && uId.length == 0) uId = cVal;
+                                        if (([cName containsString:@"name"] || [cName containsString:@"nick"] || [cName containsString:@"title"]) && uName.length == 0) uName = cVal;
+                                        if ([cName containsString:@"isgroup"] || [cName containsString:@"type"]) {
+                                            if ([cVal intValue] == 1 || [cVal intValue] == 2) isGroupFlag = YES;
+                                        }
+                                    }
+                                    
+                                    if (uId.length > 0 && ![addedIds containsObject:uId]) {
+                                        [addedIds addObject:uId];
+                                        HOMassTargetItem *item = [HOMassTargetItem new];
+                                        item.targetId = uId;
+                                        item.name = uName.length > 0 ? uName : [NSString altName:uId];
+                                        item.detail = isGroupFlag ? [NSString stringWithFormat:@"本地群ID: %@", uId] : [NSString stringWithFormat:@"本地用户ID: %@", uId];
+                                        item.type = isGroupFlag ? HOMassTargetTypeGroup : HOMassTargetTypeFriend;
+                                        
+                                        if (isGroupFlag) {
+                                            [self.groupsList addObject:item];
+                                        } else {
+                                            [self.friendsList addObject:item];
+                                        }
+                                    }
+                                }
+                                sqlite3_finalize(qStmt);
+                            }
+                        }
+                    }
+                    sqlite3_finalize(stmt);
+                }
+                sqlite3_close(db);
+            }
+        }
+        
+        // 2. 内存实时控制器兜底补充 (防止数据库未全量落盘)
         UIWindow *window = [UIApplication sharedApplication].keyWindow;
         UIViewController *rootVC = window.rootViewController;
         if (rootVC) {
@@ -111,99 +190,46 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
                     NSString *name = [self getUnderlyingIvar:@"name" fromObject:recent] ?: [self getUnderlyingIvar:@"nickName" fromObject:recent] ?: @"会话";
                     NSNumber *isGroup = [self getUnderlyingIvar:@"isGroup" fromObject:recent] ?: [self getUnderlyingIvar:@"chatType" fromObject:recent];
                     
-                    if (chatId.length == 0) continue;
+                    if (chatId.length == 0 || [addedIds containsObject:chatId]) continue;
+                    [addedIds addObject:chatId];
+                    
+                    HOMassTargetItem *item = [HOMassTargetItem new];
+                    item.targetId = chatId;
+                    item.name = name;
+                    item.rawModel = recent;
+                    
                     if ([isGroup intValue] == 1 || [isGroup intValue] == 2) {
-                        if (![addedGroupIds containsObject:chatId]) {
-                            [addedGroupIds addObject:chatId];
-                            HOMassTargetItem *item = [HOMassTargetItem new];
-                            item.targetId = chatId;
-                            item.name = name;
-                            item.detail = [NSString stringWithFormat:@"群ID: %@", chatId];
-                            item.type = HOMassTargetTypeGroup;
-                            item.rawModel = recent;
-                            [self.groupsList addObject:item];
-                        }
-                    } else {
-                        if (![addedFriendIds containsObject:chatId]) {
-                            [addedFriendIds addObject:chatId];
-                            HOMassTargetItem *item = [HOMassTargetItem new];
-                            item.targetId = chatId;
-                            item.name = name;
-                            item.detail = [NSString stringWithFormat:@"好友ID: %@", chatId];
-                            item.type = HOMassTargetTypeFriend;
-                            item.rawModel = recent;
-                            [self.friendsList addObject:item];
-                        }
-                    }
-                }
-            }
-        }
-        
-        // 2. 沙盒 SQLite 数据库直读兜底（确保无视 UI 状态直接查出全部本地好友与群）
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *docDir = paths.firstObject;
-        // 向上检索 Library 目录
-        NSString *libDir = [docDir stringByDeletingLastPathComponent];
-        NSString *targetDbPath = nil;
-        
-        // 递归查找应用沙盒中的 .db 或 .sqlite 文件
-        NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtPath:libDir];
-        for (NSString *subPath in enumerator) {
-            if ([subPath.pathExtension isEqualToString:@"db"] || [subPath.pathExtension isEqualToString:@"sqlite"]) {
-                targetDbPath = [libDir stringByAppendingPathComponent:subPath];
-                break;
-            }
-        }
-        
-        if (targetDbPath) {
-            sqlite3 *db = NULL;
-            if (sqlite3_open([targetDbPath UTF8String], &db) == SQLITE_OK) {
-                // 查询可能的联系人或会话表
-                const char *sql = "SELECT name, sql FROM sqlite_master WHERE type='table';";
-                sqlite3_stmt *stmt = NULL;
-                if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-                    while (sqlite3_step(stmt) == SQLITE_ROW) {
-                        const char *tableName = (const char *)sqlite3_column_text(stmt, 0);
-                        if (tableName) {
-                            NSString *tName = [NSString stringWithUTF8String:tableName];
-                            // 如果表名包含 user / friend / contact / group 等关键字，尝试捞取数据
-                            if ([tName rangeOfString:@"user" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                                [tName rangeOfString:@"friend" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                                [tName rangeOfString:@"chat" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                                NSString *querySql = [NSString stringWithFormat:@"SELECT * FROM %@ LIMIT 500;", tName];
-                                sqlite3_stmt *qStmt = NULL;
-                                if (sqlite3_prepare_v2(db, [querySql UTF8String], -1, &qStmt, NULL) == SQLITE_OK) {
-                                    while (sqlite3_step(qStmt) == SQLITE_ROW) {
-                                        // 简单提取前两列作为 ID 与 昵称
-                                        const char *c0 = (const char *)sqlite3_column_text(qStmt, 0);
-                                        const char *c1 = (const char *)sqlite3_column_text(qStmt, 1);
-                                        if (c0 && c1) {
-                                            NSString *uId = [NSString stringWithUTF8String:c0];
-                                            NSString *uName = [NSString stringWithUTF8String:c1];
-                                            if (uId.length > 0 && uName.length > 0 && ![addedFriendIds containsObject:uId]) {
-                                                [addedFriendIds addObject:uId];
-                                                HOMassTargetItem *item = [HOMassTargetItem new];
-                                                item.targetId = uId;
-                                                item.name = uName;
-                                                item.detail = [NSString stringWithFormat:@"本地库同步 ID: %@", uId];
-                                                item.type = HOMassTargetTypeFriend;
-                                                [self.friendsList addObject:item];
-                                            }
-                                        }
-                                    }
-                                    sqlite3_finalize(qStmt);
+                        item.detail = [NSString stringWithFormat:@"实时群ID: %@", chatId];
+                        item.type = HOMassTargetTypeGroup;
+                        [self.groupsList addObject:item];
+                        
+                        // 顺便提取内存中已有的群成员
+                        NSArray *members = [self getUnderlyingIvar:@"groupMemberList" fromObject:recent] ?: [self getUnderlyingIvar:@"members" fromObject:recent];
+                        if ([members isKindOfClass:[NSArray class]]) {
+                            for (id m in members) {
+                                NSString *mUid = [NSString stringWithFormat:@"%@", [self getUnderlyingIvar:@"userId" fromObject:m] ?: [self getUnderlyingIvar:@"id" fromObject:m] ?: @""];
+                                if (mUid.length > 0 && ![addedIds containsObject:mUid]) {
+                                    [addedIds addObject:mUid];
+                                    HOMassTargetItem *mItem = [HOMassTargetItem new];
+                                    mItem.targetId = mUid;
+                                    mItem.name = [self getUnderlyingIvar:@"showName" fromObject:m] ?: [self getUnderlyingIvar:@"nickName" fromObject:m] ?: @"群成员";
+                                    mItem.detail = [NSString stringWithFormat:@"所属群: %@", name];
+                                    mItem.type = HOMassTargetTypeGroupMember;
+                                    [self.groupMembersList addObject:mItem];
                                 }
                             }
                         }
+                    } else {
+                        item.detail = [NSString stringWithFormat:@"实时好友ID: %@", chatId];
+                        item.type = HOMassTargetTypeFriend;
+                        [self.friendsList addObject:item];
                     }
-                    sqlite3_finalize(stmt);
                 }
-                sqlite3_close(db);
             }
         }
         
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSString *summary = [NSString stringWithFormat:@"刷新成功：好友 %lu 人 | 群聊 %lu 个 | 群成员 %lu 人",
+            NSString *summary = [NSString stringWithFormat:@"刷新成功：好友 %lu | 群聊 %lu | 群成员 %lu",
                              (unsigned long)self.friendsList.count,
                              (unsigned long)self.groupsList.count,
                              (unsigned long)self.groupMembersList.count];
@@ -212,7 +238,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
     });
 }
 
-// 消息群发执行
+// 消息群发底层调用
 - (void)sendMassMessage:(NSString *)text toTargets:(NSArray<HOMassTargetItem *> *)targets interval:(NSTimeInterval)interval progress:(void(^)(NSInteger current, NSInteger total))progress completion:(void(^)(NSInteger sentCount))completion {
     if (text.length == 0 || targets.count == 0) {
         if (completion) completion(0);
@@ -278,10 +304,16 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 }
 @end
 
+@implementation NSString (HOExt)
++ (NSString *)altName:(NSString *)uid {
+    return [NSString stringWithFormat:@"用户_%@", uid.length > 6 ? [uid substringFromIndex:uid.length - 6] : uid];
+}
+@end
+
 // ==========================================
-// 3. 群发助手面板控制器
+// 3. 群发助手面板 UI 控制器
 // ==========================================
-@interface HOMassAssistantController : UIViewController <UITableViewDelegate, UITableViewDataSource, UISearchBarDelegate>
+@interface HOMassAssistantController : UIViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UISegmentedControl *segment;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UITextField *inputField;
@@ -301,7 +333,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
     
     [self setupNavBar];
     [self setupViews];
-    [self doRefreshData]; // 首次打开自动刷新一次
+    [self doRefreshData];
 }
 
 - (void)setupNavBar {
@@ -333,7 +365,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
     self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 6, self.view.bounds.size.width - 32, 20)];
     self.statusLabel.font = [UIFont systemFontOfSize:12];
     self.statusLabel.textColor = [UIColor secondaryLabelColor];
-    self.statusLabel.text = @"就绪：点击右上角【🔄 刷新获取】同步最新通讯录与本地库";
+    self.statusLabel.text = @"就绪：点击右上角【🔄 刷新获取】";
     [bottomBar addSubview:self.statusLabel];
     
     self.inputField = [[UITextField alloc] initWithFrame:CGRectMake(16, 32, self.view.bounds.size.width - 116, 40)];
@@ -356,7 +388,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 }
 
 - (void)doRefreshData {
-    self.statusLabel.text = @"⏳ 正在从内存与本地 SQLite 库同步提取...";
+    self.statusLabel.text = @"⏳ 正在从本地数据库提取...";
     [[HOMassDataManager shared] manualRefreshAllData:^(NSString *summary) {
         self.statusLabel.text = summary;
         [self switchTab:self.segment.selectedSegmentIndex];
@@ -469,7 +501,7 @@ static NSInteger hook_numberOfRows(id self, SEL _cmd, UITableView *tableView, NS
     NSInteger origCount = orig_numberOfRows(self, _cmd, tableView, section);
     NSInteger totalSections = [tableView numberOfSections];
     if (section == totalSections - 1) {
-        return origCount + 1; // 增加一行“群发助手”
+        return origCount + 1;
     }
     return origCount;
 }
@@ -524,19 +556,19 @@ __attribute__((constructor)) static void InitHaiouMassHook() {
         if (mineCls) {
             Method mRows = class_getInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:));
             if (mRows) {
-                orig_numberOfRows = (__typeof__(orig_numberOfRows))method_getImplementation(mRows);
+                orig_numberOfRows = (void *)method_getImplementation(mRows);
                 method_setImplementation(mRows, (IMP)hook_numberOfRows);
             }
             
             Method mCell = class_getInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:));
             if (mCell) {
-                orig_cellForRow = (__typeof__(orig_cellForRow))method_getImplementation(mCell);
+                orig_cellForRow = (void *)method_getImplementation(mCell);
                 method_setImplementation(mCell, (IMP)hook_cellForRow);
             }
             
             Method mSelect = class_getInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:));
             if (mSelect) {
-                orig_didSelectRow = (__typeof__(orig_didSelectRow))method_getImplementation(mSelect);
+                orig_didSelectRow = (void *)method_getImplementation(mSelect);
                 method_setImplementation(mSelect, (IMP)hook_didSelectRow);
             }
         }
