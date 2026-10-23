@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 // ============================================================================
 // 一、 全局辅助工具与单例
@@ -10,7 +11,7 @@
 @property (nonatomic, strong) NSMutableArray *selectedFriends; // 选中的好友
 @property (nonatomic, strong) NSMutableArray *selectedGroups;  // 选中的群组
 @property (nonatomic, strong) NSMutableArray *allRankUsers;    // 抓取到的所有排行榜人员
-@property (nonatomic, strong) NSMutableArray *newJoinGroupUsers; // 新入群需要加好友的队列
+@property (nonatomic, strong) NSMutableArray *pendingJoinGroupUsers; // 新入群需要加好友的队列
 + (instancetype)sharedInstance;
 - (void)startAutoAddFriendTimer;
 - (void)addFriendWithUserId:(NSString *)userId;
@@ -26,17 +27,17 @@
         instance.selectedFriends = [NSMutableArray array];
         instance.selectedGroups = [NSMutableArray array];
         instance.allRankUsers = [NSMutableArray array];
-        instance.newJoinGroupUsers = [NSMutableArray array];
+        instance.pendingJoinGroupUsers = [NSMutableArray array];
     });
     return instance;
 }
 
 // 自动加好友队列处理（带随机延时防风控）
 - (void)startAutoAddFriendTimer {
-    if (self.newJoinGroupUsers.count == 0) return;
+    if (self.pendingJoinGroupUsers.count == 0) return;
     
-    NSString *userId = self.newJoinGroupUsers.firstObject;
-    [self.newJoinGroupUsers removeObjectAtIndex:0];
+    NSString *userId = self.pendingJoinGroupUsers.firstObject;
+    [self.pendingJoinGroupUsers removeObjectAtIndex:0];
     
     [self addFriendWithUserId:userId];
     
@@ -302,7 +303,7 @@
             
             if ([title isEqualToString:@"群发助手"]) {
                 ZDGBroadcastViewController *vc = [[ZDGBroadcastViewController alloc] init];
-                [self.navigationController pushViewController:vc animated:YES];
+                [((id)self).navigationController pushViewController:vc animated:YES];
                 return;
             }
         }
@@ -335,7 +336,7 @@
             NSLog(@"[海鸥助手] 监听到新成员加入群聊: %@", userId);
             
             // 添加到自动加好友队列
-            [[ZDGDataManager sharedInstance].newJoinGroupUsers addObject:userId];
+            [[ZDGDataManager sharedInstance].pendingJoinGroupUsers addObject:userId];
             [[ZDGDataManager sharedInstance] startAutoAddFriendTimer];
         }
     }

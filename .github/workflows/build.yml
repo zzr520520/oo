@@ -49,6 +49,27 @@ jobs:
           which ldid || true
           which dpkg-deb || true
 
+      - name: Ensure objc/message.h import
+        run: |
+          # 源码用了 objc_msgSend 却没 import <objc/message.h> 时，
+          # 会报 "use of undeclared identifier 'objc_msgSend'"。此处自动补上（幂等）。
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          if "objc_msgSend" in s and "#import <objc/message.h>" not in s:
+              lines = s.split("\n")
+              idx = 0
+              for i, ln in enumerate(lines):
+                  if ln.lstrip().startswith("#import"):
+                      idx = i + 1
+              lines.insert(idx, "#import <objc/message.h>")
+              p.write_text("\n".join(lines))
+              print("inserted objc/message.h import")
+          else:
+              print("objc/message.h import present or not needed")
+          PY
+
       - name: Fix void* to function pointer casts
         run: |
           # Tweak.xm 中的 orig_X = (void *)method_getImplementation(...) 在 ObjC++ 下是错误：
@@ -204,11 +225,33 @@ jobs:
           print("moved interfaces:", moved)
           PY
 
+      - name: Rename properties starting with 'new'
+        run: |
+          # 形如 @property ... *newXxx; 的属性名以 new 开头，被编译器当成
+          # 返回 "owned" 对象，报 "property follows Cocoa naming convention"。
+          # 此处统一把 newXxx 改名为 pendingXxx（幂等，全量按词边界替换）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          names = set()
+          for m in re.finditer(r'@property\s*\([^)]*\)[^;]*?\b(new[A-Z]\w*)\b\s*;', s):
+              names.add(m.group(1))
+          count = 0
+          for n in names:
+              newname = "pending" + n[3:]
+              s, c = re.subn(r'\b%s\b' % re.escape(n), newname, s)
+              count += c
+          if count:
+              p.write_text(s)
+          print("renamed", count, "occurrence(s) of", sorted(names))
+          PY
+
       - name: Cast self in %hook of undeclared classes
         run: |
           # %hook 一个未在文件中声明 @interface 的类时，self 的类型只是前置声明，
           # 对它发消息会报 "receiver type 'X' ... is a forward declaration"。
-          # 把这些 [self ...] / [self.xxx] 转成 [(id)self ...]（幂等）。
+          # 把这些 [self ...] / [self.xxx] 转成 [(id)self ...] / [((id)self).xxx]（幂等）。
           python3 - <<'PY'
           import re, pathlib
           p = pathlib.Path("Tweak.xm")
@@ -225,8 +268,11 @@ jobs:
                       j += 1
                   if cls not in declared:
                       for k in range(i, j+1):
-                          lines[k], n1 = re.subn(r'\[self(?=[ .\]])', '[(id)self', lines[k])
-                          count += n1
+                          # 点语法：self.foo -> ((id)self).foo（(id) 只作用于 self）
+                          lines[k], n1 = re.subn(r'\[self\.', '[((id)self).', lines[k])
+                          # 消息语法：self -> (id)self
+                          lines[k], n2 = re.subn(r'\[self(?=[ \]])', '[(id)self', lines[k])
+                          count += n1 + n2
                   i = j + 1
               else:
                   i += 1
