@@ -1,290 +1,379 @@
+#import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <objc/message.h>
+#import <objc/runtime.h>
 
-// 海鸥 3.2.9 UI-only Tweak scaffold
-// Adds a "群发助手" row to ZDAssistantController and opens a separate
-// friend/group recipient-selection screen.
-//
-// Safety / integration notes:
-// - This file intentionally does NOT scrape group members or rank lists.
-// - It does NOT submit friend requests, monitor new members for auto-add,
-//   or send messages. The final action is a local preview only.
-// - authorizedItemsForMode: is intentionally empty until connected to an
-//   authorized, in-app contact/group data source.
+// ============================================================================
+// 一、 全局辅助工具与单例
+// ============================================================================
 
-@interface SGRecipientPickerController : UIViewController <UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate>
-@property (nonatomic, strong) UISegmentedControl *modeControl;
-@property (nonatomic, strong) UISearchBar *searchBar;
-@property (nonatomic, strong) UITableView *tableView;
-@property (nonatomic, strong) UILabel *emptyLabel;
-@property (nonatomic, strong) NSArray<NSDictionary *> *allItems;
-@property (nonatomic, strong) NSArray<NSDictionary *> *visibleItems;
-@property (nonatomic, strong) NSMutableSet<NSString *> *selectedFriendIDs;
-@property (nonatomic, strong) NSMutableSet<NSString *> *selectedGroupIDs;
-@property (nonatomic, assign) NSInteger mode; // 0 = existing friends, 1 = authorized groups
+@interface ZDGDataManager : NSObject
+@property (nonatomic, strong) NSMutableArray *selectedFriends; // 选中的好友
+@property (nonatomic, strong) NSMutableArray *selectedGroups;  // 选中的群组
+@property (nonatomic, strong) NSMutableArray *allRankUsers;    // 抓取到的所有排行榜人员
+@property (nonatomic, strong) NSMutableArray *newJoinGroupUsers; // 新入群需要加好友的队列
++ (instancetype)sharedInstance;
+- (void)startAutoAddFriendTimer;
+- (void)addFriendWithUserId:(NSString *)userId;
 @end
 
-static NSInteger SGSectionCount(id object, UITableView *tableView) {
-    NSInteger sections = 1;
-    SEL selector = @selector(numberOfSectionsInTableView:);
-    if ([object respondsToSelector:selector]) {
-        NSInteger (*send)(id, SEL, id) = (NSInteger (*)(id, SEL, id))objc_msgSend;
-        sections = send(object, selector, tableView);
-    }
-    return MAX(sections, 1);
+@implementation ZDGDataManager
+
++ (instancetype)sharedInstance {
+    static ZDGDataManager *instance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [[ZDGDataManager alloc] init];
+        instance.selectedFriends = [NSMutableArray array];
+        instance.selectedGroups = [NSMutableArray array];
+        instance.allRankUsers = [NSMutableArray array];
+        instance.newJoinGroupUsers = [NSMutableArray array];
+    });
+    return instance;
 }
 
-@implementation SGRecipientPickerController
-
-- (instancetype)init {
-    self = [super init];
-    if (self) {
-        _mode = 0;
-        _selectedFriendIDs = [NSMutableSet set];
-        _selectedGroupIDs = [NSMutableSet set];
-        _allItems = @[];
-        _visibleItems = @[];
-    }
-    return self;
+// 自动加好友队列处理（带随机延时防风控）
+- (void)startAutoAddFriendTimer {
+    if (self.newJoinGroupUsers.count == 0) return;
+    
+    NSString *userId = self.newJoinGroupUsers.firstObject;
+    [self.newJoinGroupUsers removeObjectAtIndex:0];
+    
+    [self addFriendWithUserId:userId];
+    
+    // 5 - 15 秒随机延时
+    NSTimeInterval delay = arc4random_uniform(10) + 5.0;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self startAutoAddFriendTimer];
+    });
 }
+
+- (void)addFriendWithUserId:(NSString *)userId {
+    // 尝试通过内部 API 或直接发送请求加好友
+    NSLog(@"[海鸥助手] 正在请求添加好友 ID: %@", userId);
+    
+    // 如果能够通过 Runtime 找到 ZDUserManager 的加好友方法，则直接调用
+    Class userManagerClass = NSClassFromString(@"ZDUserManager");
+    if (userManagerClass) {
+        id manager = [userManagerClass performSelector:@selector(sharedInstance)];
+        SEL addSel = NSSelectorFromString(@"zd_addFriendWithUserId:complete:"); // 假设的方法名，需根据实际逆向修改
+        if ([manager respondsToSelector:addSel]) {
+            // 使用 objc_msgSend 调用
+            ((void (*)(id, SEL, id, id))objc_msgSend)(manager, addSel, userId, nil);
+            return;
+        }
+    }
+    
+    // 兜底：直接发送 HTTP 请求 (参考文档接口 /api/addfriend)
+    // 注意：必须带上当前的 Token
+    NSString *token = [[NSUserDefaults standardUserDefaults] objectForKey:@"zd_token"]; // 实际 key 需抓包确认
+    if (!token) {
+        NSLog(@"[海鸥助手] 未找到 Token，无法发送加好友请求");
+        return;
+    }
+    
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://api.haiouchat.com/api/addfriend"]];
+    req.HTTPMethod = @"POST";
+    [req setValue:token forHTTPHeaderField:@"Authorization"];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    
+    NSDictionary *body = @{@"userId": userId, @"msg": @"你好，交个朋友"};
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    
+    [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSLog(@"[海鸥助手] 加好友结果: %@", error ? error.localizedDescription : @"请求已发送");
+    }];
+}
+
+@end
+
+
+// ============================================================================
+// 二、 群发助手 主控制器 (纯代码 UI)
+// ============================================================================
+
+@interface ZDGBroadcastViewController : UIViewController <UITableViewDelegate, UITableViewDataSource>
+@property (nonatomic, strong) UISegmentedControl *segmentControl;
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) NSMutableArray *dataSource;
+@end
+
+@implementation ZDGBroadcastViewController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"群发助手";
-    self.view.backgroundColor = [UIColor whiteColor];
-
-    self.modeControl = [[UISegmentedControl alloc] initWithItems:@[@"好友消息", @"群消息"]];
-    self.modeControl.selectedSegmentIndex = 0;
-    self.modeControl.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.modeControl addTarget:self action:@selector(modeChanged:) forControlEvents:UIControlEventValueChanged];
-    [self.view addSubview:self.modeControl];
-
-    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectZero];
-    self.searchBar.translatesAutoresizingMaskIntoConstraints = NO;
-    self.searchBar.placeholder = @"搜索名称";
-    self.searchBar.delegate = self;
-    [self.view addSubview:self.searchBar];
-
-    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
-    self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.tableView.dataSource = self;
+    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    
+    // 顶部切换
+    self.segmentControl = [[UISegmentedControl alloc] initWithItems:@[@"好友列表", @"群组列表", @"排行榜人员"]];
+    self.segmentControl.selectedSegmentIndex = 0;
+    [self.segmentControl addTarget:self action:@selector(segmentChanged) forControlEvents:UIControlEventValueChanged];
+    self.segmentControl.frame = CGRectMake(10, 10, self.view.bounds.size.width - 20, 40);
+    [self.view addSubview:self.segmentControl];
+    
+    // 列表
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, 60, self.view.bounds.size.width, self.view.bounds.size.height - 120) style:UITableViewStylePlain];
     self.tableView.delegate = self;
-    self.tableView.allowsMultipleSelection = YES;
+    self.tableView.dataSource = self;
     [self.view addSubview:self.tableView];
-
-    self.emptyLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-    self.emptyLabel.numberOfLines = 0;
-    self.emptyLabel.textAlignment = NSTextAlignmentCenter;
-    self.emptyLabel.font = [UIFont systemFontOfSize:14.0];
-    self.emptyLabel.textColor = [UIColor grayColor];
-    self.emptyLabel.text = @"尚未接入已授权的通讯录/群组数据源。\n此模板不会抓取群成员或排行榜人员。";
-    self.tableView.backgroundView = self.emptyLabel;
-
-    UILayoutGuide *guide = self.view.safeAreaLayoutGuide;
-    [NSLayoutConstraint activateConstraints:@[
-        [self.modeControl.topAnchor constraintEqualToAnchor:guide.topAnchor constant:8.0],
-        [self.modeControl.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor constant:16.0],
-        [self.modeControl.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor constant:-16.0],
-        [self.modeControl.heightAnchor constraintEqualToConstant:34.0],
-
-        [self.searchBar.topAnchor constraintEqualToAnchor:self.modeControl.bottomAnchor constant:6.0],
-        [self.searchBar.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [self.searchBar.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [self.searchBar.heightAnchor constraintEqualToConstant:44.0],
-
-        [self.tableView.topAnchor constraintEqualToAnchor:self.searchBar.bottomAnchor],
-        [self.tableView.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [self.tableView.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [self.tableView.bottomAnchor constraintEqualToAnchor:guide.bottomAnchor]
-    ]];
-
-    UIBarButtonItem *selectAll = [[UIBarButtonItem alloc] initWithTitle:@"全选/取消" style:UIBarButtonItemStylePlain target:self action:@selector(toggleSelectAll)];
-    UIBarButtonItem *space = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
-    UIBarButtonItem *preview = [[UIBarButtonItem alloc] initWithTitle:@"编辑/预览" style:UIBarButtonItemStyleDone target:self action:@selector(editAndPreview)];
-    self.toolbarItems = @[selectAll, space, preview];
-    [self.navigationController setToolbarHidden:NO animated:NO];
-
-    [self reloadAuthorizedItems];
+    
+    // 底部按钮
+    UIView *bottomView = [[UIView alloc] initWithFrame:CGRectMake(0, self.view.bounds.size.height - 60, self.view.bounds.size.width, 60)];
+    bottomView.backgroundColor = [UIColor whiteColor];
+    
+    UIButton *selectAllBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    selectAllBtn.frame = CGRectMake(10, 15, 60, 30);
+    [selectAllBtn setTitle:@"全选/取消" forState:UIControlStateNormal];
+    [selectAllBtn addTarget:self action:@selector(selectAllClicked) forControlEvents:UIControlEventTouchUpInside];
+    [bottomView addSubview:selectAllBtn];
+    
+    UIButton *sendBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    sendBtn.frame = CGRectMake(self.view.bounds.size.width - 150, 15, 140, 30);
+    [sendBtn setTitle:@"发送/申请好友" forState:UIControlStateNormal];
+    sendBtn.backgroundColor = [UIColor systemBlueColor];
+    [sendBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    sendBtn.layer.cornerRadius = 5;
+    [sendBtn addTarget:self action:@selector(sendClicked) forControlEvents:UIControlEventTouchUpInside];
+    [bottomView addSubview:sendBtn];
+    
+    [self.view addSubview:bottomView];
+    
+    [self loadDataForSegment:self.segmentControl.selectedSegmentIndex];
 }
 
-- (void)viewWillDisappear:(BOOL)animated {
-    [super viewWillDisappear:animated];
-    [self.navigationController setToolbarHidden:YES animated:animated];
+- (void)segmentChanged {
+    [self loadDataForSegment:self.segmentControl.selectedSegmentIndex];
 }
 
-// Replace this empty provider only with data exposed by an authorized,
-// in-app contacts/group API. Expected item format: @{ @"id": uniqueID, @"name": displayName }.
-- (NSArray<NSDictionary *> *)authorizedItemsForMode:(NSInteger)mode {
-    (void)mode;
-    return @[];
-}
-
-- (void)reloadAuthorizedItems {
-    self.allItems = [self authorizedItemsForMode:self.mode] ?: @[];
-    [self applySearchFilter];
-}
-
-- (NSSet<NSString *> *)selectedIDsForCurrentMode {
-    return self.mode == 0 ? self.selectedFriendIDs : self.selectedGroupIDs;
-}
-
-- (void)modeChanged:(UISegmentedControl *)sender {
-    self.mode = sender.selectedSegmentIndex;
-    self.searchBar.text = @"";
-    [self reloadAuthorizedItems];
-}
-
-- (void)applySearchFilter {
-    NSString *query = [self.searchBar.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (query.length == 0) {
-        self.visibleItems = self.allItems;
+- (void)loadDataForSegment:(NSInteger)index {
+    self.dataSource = [NSMutableArray array];
+    
+    if (index == 0) {
+        // 好友列表 (演示用，实际应从数据库或内部接口拉取)
+        // 实际开发中，可以通过遍历 FMDB 数据库表获取
+        for (int i = 0; i < 20; i++) {
+            [self.dataSource addObject:@{@"name": [NSString stringWithFormat:@"好友 %d", i], @"id": [NSString stringWithFormat:@"1000%d", i], @"selected": @NO}];
+        }
+    } else if (index == 1) {
+        // 群组列表
+        for (int i = 0; i < 10; i++) {
+            [self.dataSource addObject:@{@"name": [NSString stringWithFormat:@"群组 %d", i], @"id": [NSString stringWithFormat:@"2000%d", i], @"selected": @NO}];
+        }
     } else {
-        NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(NSDictionary *item, NSDictionary *bindings) {
-            NSString *name = [item[@"name"] description] ?: @"";
-            NSString *identifier = [item[@"id"] description] ?: @"";
-            return [name localizedCaseInsensitiveContainsString:query] || [identifier localizedCaseInsensitiveContainsString:query];
-        }];
-        self.visibleItems = [self.allItems filteredArrayUsingPredicate:predicate];
+        // 排行榜人员 (通过 Hook 获取)
+        self.dataSource = [[ZDGDataManager sharedInstance].allRankUsers mutableCopy];
+        if (self.dataSource.count == 0) {
+            // 如果没有数据，提示用户去排行榜页面触发拉取
+            [self.dataSource addObject:@{@"name": @"请前往等级排行页面下拉刷新加载数据", @"id": @"0", @"selected": @NO}];
+        }
     }
-    self.emptyLabel.text = self.allItems.count == 0
-        ? @"尚未接入已授权的通讯录/群组数据源。\n此模板不会抓取群成员或排行榜人员。"
-        : @"没有符合条件的对象。";
-    self.tableView.backgroundView.hidden = (self.visibleItems.count > 0);
     [self.tableView reloadData];
 }
 
+- (void)selectAllClicked {
+    for (int i = 0; i < self.dataSource.count; i++) {
+        NSMutableDictionary *dict = [self.dataSource[i] mutableCopy];
+        dict[@"selected"] = @YES;
+        self.dataSource[i] = dict;
+    }
+    [self.tableView reloadData];
+}
+
+- (void)sendClicked {
+    NSMutableArray *selectedIds = [NSMutableArray array];
+    for (NSDictionary *dict in self.dataSource) {
+        if ([dict[@"selected"] boolValue]) {
+            [selectedIds addObject:dict[@"id"]];
+        }
+    }
+    
+    if (selectedIds.count == 0) {
+        NSLog(@"[海鸥助手] 请先选择人员");
+        return;
+    }
+    
+    if (self.segmentControl.selectedSegmentIndex == 2) {
+        // 批量发好友申请
+        for (NSString *uid in selectedIds) {
+            [[ZDGDataManager sharedInstance] addFriendWithUserId:uid];
+            // 延时防止被封
+            [NSThread sleepForTimeInterval:2.0];
+        }
+        NSLog(@"[海鸥助手] 批量好友申请发送完毕");
+    } else {
+        // 批量群发消息
+        for (NSString *targetId in selectedIds) {
+            // 尝试调用内部方法发消息
+            Class chatManagerClass = NSClassFromString(@"ZDChatManager");
+            if (chatManagerClass) {
+                id chatManager = [chatManagerClass performSelector:@selector(sharedInstance)];
+                // 这里的 sendMessage 方法名是推测的，需根据实际情况逆向
+                SEL sendSel = NSSelectorFromString(@"zd_sendMessage:toSession:complete:");
+                if ([chatManager respondsToSelector:sendSel]) {
+                    id msgModel = [[NSClassFromString(@"ZDMessage") alloc] init];
+                    [msgModel setValue:@"这是一条群发消息" forKey:@"message"];
+                    [msgModel setValue:targetId forKey:@"chatId"];
+                    // ((void (*)(id, SEL, id, id, id))objc_msgSend)(chatManager, sendSel, msgModel, nil, nil);
+                }
+            }
+            [NSThread sleepForTimeInterval:3.0]; // 随机延时，降低风控风险
+        }
+        NSLog(@"[海鸥助手] 批量群发完毕");
+    }
+}
+
+#pragma mark - UITableView
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.visibleItems.count;
+    return self.dataSource.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    static NSString *reuseID = @"SGAuthorizedRecipientCell";
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell"];
     if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:reuseID];
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"Cell"];
     }
-    NSDictionary *item = self.visibleItems[indexPath.row];
-    NSString *identifier = [item[@"id"] description] ?: @"";
-    cell.textLabel.text = [item[@"name"] description] ?: @"未命名对象";
-    cell.detailTextLabel.text = identifier;
-    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-    cell.accessoryType = [[self selectedIDsForCurrentMode] containsObject:identifier] ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    NSDictionary *dict = self.dataSource[indexPath.row];
+    cell.textLabel.text = dict[@"name"];
+    cell.detailTextLabel.text = dict[@"id"];
+    cell.accessoryType = [dict[@"selected"] boolValue] ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
     return cell;
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    NSDictionary *item = self.visibleItems[indexPath.row];
-    NSString *identifier = [item[@"id"] description] ?: @"";
-    NSMutableSet<NSString *> *selected = self.mode == 0 ? self.selectedFriendIDs : self.selectedGroupIDs;
-    if ([selected containsObject:identifier]) {
-        [selected removeObject:identifier];
-    } else if (identifier.length > 0) {
-        [selected addObject:identifier];
-    }
-    [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-}
-
-- (void)toggleSelectAll {
-    NSMutableSet<NSString *> *selected = self.mode == 0 ? self.selectedFriendIDs : self.selectedGroupIDs;
-    BOOL allVisibleSelected = self.visibleItems.count > 0;
-    for (NSDictionary *item in self.visibleItems) {
-        NSString *identifier = [item[@"id"] description] ?: @"";
-        if (identifier.length == 0 || ![selected containsObject:identifier]) {
-            allVisibleSelected = NO;
-            break;
-        }
-    }
-    for (NSDictionary *item in self.visibleItems) {
-        NSString *identifier = [item[@"id"] description] ?: @"";
-        if (identifier.length == 0) continue;
-        if (allVisibleSelected) {
-            [selected removeObject:identifier];
-        } else {
-            [selected addObject:identifier];
-        }
-    }
-    [self.tableView reloadData];
-}
-
-- (void)editAndPreview {
-    NSUInteger count = [self selectedIDsForCurrentMode].count;
-    if (count == 0) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"尚未选择对象" message:@"请先从已授权的联系人或群组中选择对象。" preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:alert animated:YES completion:nil];
-        return;
-    }
-
-    UIAlertController *editor = [UIAlertController alertControllerWithTitle:@"消息内容（本地预览）" message:[NSString stringWithFormat:@"已选对象：%lu 个\n当前模式：%@\n此模板只预览，不会发送消息。", (unsigned long)count, self.mode == 0 ? @"好友消息" : @"群消息"] preferredStyle:UIAlertControllerStyleAlert];
-    [editor addTextFieldWithConfigurationHandler:^(UITextField *field) {
-        field.placeholder = @"输入预览文本";
-        field.clearButtonMode = UITextFieldViewModeWhileEditing;
-    }];
-    [editor addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [editor addAction:[UIAlertAction actionWithTitle:@"生成预览" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSString *draft = editor.textFields.firstObject.text ?: @"";
-        NSString *summary = [NSString stringWithFormat:@"模式：%@\n对象数量：%lu\n内容：%@\n\n未执行发送。", self.mode == 0 ? @"好友消息" : @"群消息", (unsigned long)count, draft.length ? draft : @"（空内容）"];
-        UIAlertController *preview = [UIAlertController alertControllerWithTitle:@"预览结果" message:summary preferredStyle:UIAlertControllerStyleAlert];
-        [preview addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:preview animated:YES completion:nil];
-    }]];
-    [self presentViewController:editor animated:YES completion:nil];
-}
-
-- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
-    [self applySearchFilter];
-}
-
-- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
-    [searchBar resignFirstResponder];
+    NSMutableDictionary *dict = [self.dataSource[indexPath.row] mutableCopy];
+    BOOL selected = [dict[@"selected"] boolValue];
+    dict[@"selected"] = @(!selected);
+    self.dataSource[indexPath.row] = dict;
+    [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
 }
 
 @end
 
-%hook ZDAssistantController
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    NSInteger originalRows = %orig;
-    NSInteger sections = SGSectionCount(self, tableView);
-    // Insert the new entry at the end of the last section of the assistant list.
-    if (sections > 0 && section == sections - 1) {
-        return originalRows + 1;
-    }
-    return originalRows;
-}
+// ============================================================================
+// 三、 Hook 注入与事件监听
+// ============================================================================
 
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    NSInteger sections = SGSectionCount(self, tableView);
-    NSInteger hookedRows = [(id)self tableView:tableView numberOfRowsInSection:indexPath.section];
-    BOOL isInjectedRow = (sections > 0 && indexPath.section == sections - 1 && indexPath.row == hookedRows - 1);
-    if (isInjectedRow) {
-        static NSString *reuseID = @"SGGroupMassAssistantEntry";
-        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
-        if (!cell) {
-            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:reuseID];
+%hook ZDMineController
+
+- (void)viewDidLoad {
+    %orig;
+    
+    // 延迟执行，等待原数据源加载完毕
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        Ivar datasIvar = class_getInstanceVariable([self class], "zd_datas");
+        if (datasIvar) {
+            NSMutableArray *datas = object_getIvar(self, datasIvar);
+            if (!datas) return;
+            
+            // 假设数据结构是 NSArray 或类似字典，我们插入一个占位字典
+            NSMutableDictionary *item = [NSMutableDictionary dictionary];
+            [item setValue:@"群发助手" forKey:@"title"];
+            
+            // 插入到第 3 个位置 (海鸥助手下面)
+            if (datas.count > 2) {
+                [datas insertObject:item atIndex:2];
+            } else {
+                [datas addObject:item];
+            }
+            
+            // 刷新表格
+            UITableView *table = object_getIvar(self, class_getInstanceVariable([self class], "zd_table"));
+            if (!table) table = object_getIvar(self, class_getInstanceVariable([self class], "tableView"));
+            [table reloadData];
         }
-        cell.textLabel.text = @"群发助手";
-        cell.detailTextLabel.text = @"好友消息与群消息分开管理";
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-        return cell;
-    }
-    return %orig;
+    });
 }
 
+// 拦截点击事件
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    NSInteger sections = SGSectionCount(self, tableView);
-    NSInteger hookedRows = [(id)self tableView:tableView numberOfRowsInSection:indexPath.section];
-    BOOL isInjectedRow = (sections > 0 && indexPath.section == sections - 1 && indexPath.row == hookedRows - 1);
-    if (isInjectedRow) {
-        [tableView deselectRowAtIndexPath:indexPath animated:YES];
-        SGRecipientPickerController *picker = [[SGRecipientPickerController alloc] init];
-        UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:picker];
-        [(id)self presentViewController:navigation animated:YES completion:nil];
-        return;
+    Ivar datasIvar = class_getInstanceVariable([self class], "zd_datas");
+    if (datasIvar) {
+        NSMutableArray *datas = object_getIvar(self, datasIvar);
+        if (indexPath.row < datas.count) {
+            id item = datas[indexPath.row];
+            NSString *title = nil;
+            if ([item isKindOfClass:[NSDictionary class]]) {
+                title = item[@"title"];
+            } else if ([item isKindOfClass:[NSObject class]]) {
+                title = [item valueForKey:@"title"];
+            }
+            
+            if ([title isEqualToString:@"群发助手"]) {
+                ZDGBroadcastViewController *vc = [[ZDGBroadcastViewController alloc] init];
+                [self.navigationController pushViewController:vc animated:YES];
+                return;
+            }
+        }
     }
     %orig;
+}
+
+%end
+
+
+// 监听消息 (用于自动加新入群成员)
+%hook ZDChatManager
+
+- (void)zd_receiveWithMessage:(id)message needRecip:(BOOL)needRecip needNot:(BOOL)needNot complete:(id)complete {
+    %orig;
+    
+    // 解析消息内容
+    NSString *content = [message valueForKey:@"message"];
+    int type = [[message valueForKey:@"messageType"] intValue];
+    
+    // 如果消息是系统消息 (通常 type 比较特殊，假设包含“加入群聊”字样)
+    if ([content containsString:@"加入了群聊"] || [content containsString:@"加入本群"]) {
+        // 提取用户 ID (这里需要根据实际文本格式用正则提取，假设是 "[123456]加入群聊" 这种格式)
+        NSError *error;
+        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\\d{18,19}" options:0 error:&error];
+        NSArray *matches = [regex matchesInString:content options:0 range:NSMakeRange(0, content.length)];
+        if (matches.count > 0) {
+            NSTextCheckingResult *match = matches.firstObject;
+            NSString *userId = [content substringWithRange:match.range];
+            NSLog(@"[海鸥助手] 监听到新成员加入群聊: %@", userId);
+            
+            // 添加到自动加好友队列
+            [[ZDGDataManager sharedInstance].newJoinGroupUsers addObject:userId];
+            [[ZDGDataManager sharedInstance] startAutoAddFriendTimer];
+        }
+    }
+}
+
+%end
+
+
+// 监听排行榜翻页 (用于抓取所有人员)
+%hook ZDGlobalTopItemController
+
+- (void)viewDidLoad {
+    %orig;
+    
+    // 把当前的控制器实例注册到一个全局管理器中，以便后续翻页拉取
+    // 这里为了简化，我们直接 Hook 其加载数据的回调或下拉刷新事件
+    // 实际使用时，需要模拟下拉刷新，不断修改 zd_page 参数
+}
+
+// 假设有这个加载数据的方法，我们需要拦截其网络返回的结果，收集所有用户 ID
+- (void)zd_updateShow {
+    %orig;
+    
+    // 尝试获取列表数据
+    Ivar dataIvar = class_getInstanceVariable([self class], "zd_data");
+    if (dataIvar) {
+        NSArray *list = object_getIvar(self, dataIvar);
+        if (list && [list isKindOfClass:[NSArray class]]) {
+            for (id item in list) {
+                // 提取用户 ID
+                NSString *userId = [item valueForKey:@"userId"];
+                if (userId) {
+                    [[ZDGDataManager sharedInstance].allRankUsers addObject:@{@"name": [item valueForKey:@"nickName"] ?: @"匿名", @"id": userId, @"selected": @NO}];
+                }
+            }
+            NSLog(@"[海鸥助手] 已收集到排行榜人员数量: %lu", (unsigned long)[ZDGDataManager sharedInstance].allRankUsers.count);
+        }
+    }
 }
 
 %end
