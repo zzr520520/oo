@@ -1,9 +1,10 @@
 //
 //  HaiouMassHelper.m
 //  海鸥 3.2.9 (Build 20261022) 群发与全自动拓客助手 Dylib
-//  修复说明:
-//  1. 彻底修复点击「我的」触发 dequeueReusableCellWithIdentifier:forIndexPath: 崩溃 (source: 5)
-//  2. 排行榜改为「页码递增 + 自动从上往下拉刷新 (mj_header)」实现无限翻页采集
+//  修复重点:
+//  1. 彻底移除 0x70/0x78 裸内存写入，根除从排行榜返回时的 0x64 (objc_release) 闪退 (source: 6)
+//  2. 重构排行榜刷新节奏：支持「刷新一次自动跳到最后(新入榜用户位置)」与「3.5秒慢速沉底连刷」
+//  3. 采集池按入榜/采集先后倒序排列，最新刷出的尾部新用户自动排在最前面
 //
 
 #import <UIKit/UIKit.h>
@@ -14,20 +15,29 @@
 
 #pragma mark - ==================== 全局状态与安全辅助函数 ====================
 
-// 用于解决 UITableView dequeueReusableCellWithIdentifier:forIndexPath: 校验闪退的上下文锚点
 static __weak UITableView *g_currentMineTableView = nil;
 static NSIndexPath *g_currentRealRequestIndexPath = nil;
 
-static NSInteger SafeReadSwiftInt(id obj, ptrdiff_t offset) {
-    if (!obj) return 0;
-    uint8_t *base = (__bridge void *)obj;
-    return *(NSInteger *)(base + offset);
-}
-
-static void SafeWriteSwiftInt(id obj, ptrdiff_t offset, NSInteger val) {
-    if (!obj) return;
+// 安全通过 Runtime Ivar 名称查找真实偏移读写 Int (绝不盲写固定偏移，防止破坏 UIViewController 内存)
+static BOOL SafeSetIvarIntByName(id obj, const char *ivarName, NSInteger val) {
+    if (!obj || !ivarName) return NO;
+    Ivar ivar = class_getInstanceVariable([obj class], ivarName);
+    if (!ivar) return NO;
+    ptrdiff_t offset = ivar_getOffset(ivar);
+    if (offset <= 0x100) return NO; // 保护 UIViewController 基础字段区
     uint8_t *base = (__bridge void *)obj;
     *(NSInteger *)(base + offset) = val;
+    return YES;
+}
+
+static NSInteger SafeGetIvarIntByName(id obj, const char *ivarName, NSInteger defaultVal) {
+    if (!obj || !ivarName) return defaultVal;
+    Ivar ivar = class_getInstanceVariable([obj class], ivarName);
+    if (!ivar) return defaultVal;
+    ptrdiff_t offset = ivar_getOffset(ivar);
+    if (offset <= 0x100) return defaultVal;
+    uint8_t *base = (__bridge void *)obj;
+    return *(NSInteger *)(base + offset);
 }
 
 static void CollectLabelsTextInView(UIView *view, NSMutableArray<NSString *> *outTexts) {
@@ -43,11 +53,13 @@ static void CollectLabelsTextInView(UIView *view, NSMutableArray<NSString *> *ou
     }
 }
 
-static UICollectionView *FindCollectionViewInView(UIView *root) {
+static UIScrollView *FindRankScrollViewInView(UIView *root) {
     if (!root) return nil;
-    if ([root isKindOfClass:[UICollectionView class]]) return (UICollectionView *)root;
+    if ([root isKindOfClass:[UICollectionView class]] || [root isKindOfClass:[UITableView class]]) {
+        return (UIScrollView *)root;
+    }
     for (UIView *sub in root.subviews) {
-        UICollectionView *found = FindCollectionViewInView(sub);
+        UIScrollView *found = FindRankScrollViewInView(sub);
         if (found) return found;
     }
     return nil;
@@ -67,10 +79,11 @@ static NSString *SafeKVCString(id obj, NSString *key) {
 #pragma mark - ==================== 数据模型与全局核心引擎 ====================
 
 @interface HOModelItem : NSObject
-@property (nonatomic, copy) NSString *itemId;     // userId / 海鸥号 / groupId
-@property (nonatomic, copy) NSString *account;    // 海鸥号 / 群号
-@property (nonatomic, copy) NSString *name;       // 昵称 / 群名称
-@property (nonatomic, copy) NSString *source;     // 来源标识
+@property (nonatomic, copy) NSString *itemId;       // userId / 海鸥号 / groupId
+@property (nonatomic, copy) NSString *account;      // 海鸥号 / 群号
+@property (nonatomic, copy) NSString *name;         // 昵称 / 群名称
+@property (nonatomic, copy) NSString *source;       // 来源标识
+@property (nonatomic, assign) NSInteger collectSeq; // 采集序号 (越大代表越靠后/越新的用户)
 @property (nonatomic, assign) BOOL isGroup;
 @property (nonatomic, assign) BOOL isSelected;
 @end
@@ -79,24 +92,25 @@ static NSString *SafeKVCString(id obj, NSString *key) {
 @end
 
 @interface HOMassEngine : NSObject
-@property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *contactFriendsMap; // 通讯录已添加好友
-@property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *joinedGroupsMap;   // 独立群聊
-@property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *collectedUsersMap; // 采集池(排行榜+群成员)
+@property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *contactFriendsMap;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *joinedGroupsMap;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *collectedUsersMap;
 @property (nonatomic, strong) NSMutableSet<NSString *> *addedRequestHistory;
+@property (nonatomic, assign) NSInteger globalSeqCounter;
 
 @property (nonatomic, assign) BOOL autoAddNewGroupMember;
 @property (nonatomic, assign) BOOL unlockRankPagination;
 @property (nonatomic, copy) NSString *defaultVerifyMsg;
 @property (nonatomic, assign) NSTimeInterval batchDelay;
 
-// 排行榜下拉无限翻页控制
+// 排行榜刷新并跳转到底部控制
 @property (nonatomic, strong) NSTimer *rankPageTimer;
 @property (nonatomic, assign) BOOL isAutoPagingRank;
-@property (nonatomic, assign) NSInteger customRankPageCounter;
+@property (nonatomic, assign) NSInteger currentRankPage;
 @property (nonatomic, weak) UIViewController *activeRankVC;
-@property (nonatomic, weak) UIButton *rankFloatingBtn;
+@property (nonatomic, weak) UIButton *rankAutoBtn;
+@property (nonatomic, weak) UIButton *rankStepJumpBtn;
 
-// 记录「我的」页面“海鸥助手”所在的真实 Section 与 Row
 @property (nonatomic, assign) NSInteger haiouAssistantSection;
 @property (nonatomic, assign) NSInteger haiouAssistantRow;
 
@@ -108,8 +122,11 @@ static NSString *SafeKVCString(id obj, NSString *key) {
 - (void)enqueueAutoAddFriendWithUserId:(NSString *)uid name:(NSString *)name source:(NSString *)source;
 - (void)batchAddFriends:(NSArray<HOModelItem *> *)users verifyMsg:(NSString *)verifyMsg progress:(void(^)(NSInteger current, NSInteger total, NSString *log))progressBlock;
 - (void)batchSendMessage:(NSString *)text toItems:(NSArray<HOModelItem *> *)items progress:(void(^)(NSInteger current, NSInteger total, NSString *log))progressBlock;
-- (void)toggleRankUnlimitedAutoPageOnVC:(UIViewController *)vc;
-- (void)pullDownRankNextPageOnceOnVC:(UIViewController *)vc;
+
+// 排行榜核心动作
+- (void)refreshOnceAndJumpToBottomOnVC:(UIViewController *)vc;
+- (void)toggleSlowAutoRefreshToBottomOnVC:(UIViewController *)vc;
+- (void)stopAutoPageIfNeeded;
 @end
 
 @implementation HOMassEngine
@@ -138,7 +155,8 @@ static NSString *SafeKVCString(id obj, NSString *key) {
         
         _haiouAssistantSection = 1;
         _haiouAssistantRow = 0;
-        _customRankPageCounter = 1;
+        _currentRankPage = 1;
+        _globalSeqCounter = 1;
     }
     return self;
 }
@@ -266,11 +284,12 @@ static NSString *SafeKVCString(id obj, NSString *key) {
     sqlite3_close(db);
 }
 
-#pragma mark - 2. 排行榜 Cell 与群成员采集引擎
+#pragma mark - 2. 排行榜与群成员采集引擎
 - (void)harvestFromCellView:(UIView *)cell defaultSource:(NSString *)source {
     if (!cell) return;
     NSString *accText = nil;
     NSString *nameText = nil;
+    NSString *rankNumText = nil;
     
     if ([cell respondsToSelector:NSSelectorFromString(@"zd_account")]) {
         UILabel *accLab = ((id (*)(id, SEL))objc_msgSend)(cell, NSSelectorFromString(@"zd_account"));
@@ -279,6 +298,10 @@ static NSString *SafeKVCString(id obj, NSString *key) {
     if ([cell respondsToSelector:NSSelectorFromString(@"zd_name")]) {
         UILabel *nameLab = ((id (*)(id, SEL))objc_msgSend)(cell, NSSelectorFromString(@"zd_name"));
         if ([nameLab isKindOfClass:[UILabel class]]) nameText = nameLab.text;
+    }
+    if ([cell respondsToSelector:NSSelectorFromString(@"zd_num")]) {
+        UILabel *numLab = ((id (*)(id, SEL))objc_msgSend)(cell, NSSelectorFromString(@"zd_num"));
+        if ([numLab isKindOfClass:[UILabel class]]) rankNumText = numLab.text;
     }
     
     NSMutableArray<NSString *> *texts = [NSMutableArray array];
@@ -290,7 +313,9 @@ static NSString *SafeKVCString(id obj, NSString *key) {
         } else if (!nameText && t.length >= 1 && t.length <= 20 && ![t hasPrefix:@"Lv"] && ![t hasPrefix:@"LV"] && ![t containsString:@"经验"] && ![t containsString:@"榜"]) {
             NSScanner *sc = [NSScanner scannerWithString:t];
             NSInteger tmp;
-            if (!([sc scanInteger:&tmp] && [sc isAtEnd] && t.length <= 3)) {
+            if ([sc scanInteger:&tmp] && [sc isAtEnd] && t.length <= 4) {
+                if (!rankNumText) rankNumText = t;
+            } else {
                 nameText = t;
             }
         }
@@ -298,11 +323,19 @@ static NSString *SafeKVCString(id obj, NSString *key) {
     
     NSString *finalKey = accText.length > 0 ? accText : nameText;
     if (finalKey.length >= 2 && !_contactFriendsMap[finalKey]) {
-        HOModelItem *item = _collectedUsersMap[finalKey] ?: [[HOModelItem alloc] init];
+        HOModelItem *item = _collectedUsersMap[finalKey];
+        if (!item) {
+            item = [[HOModelItem alloc] init];
+            item.collectSeq = ++_globalSeqCounter; // 新发现的尾部用户赋予更大的序号，排在最前
+        }
         item.itemId = finalKey;
         item.account = accText ?: finalKey;
         item.name = nameText ?: finalKey;
-        item.source = source ?: @"等级排行榜";
+        if (rankNumText.length > 0) {
+            item.source = [NSString stringWithFormat:@"排行榜第%@名", rankNumText];
+        } else {
+            item.source = source ?: @"等级排行榜(尾部新用户)";
+        }
         item.isGroup = NO;
         _collectedUsersMap[finalKey] = item;
     }
@@ -316,7 +349,11 @@ static NSString *SafeKVCString(id obj, NSString *key) {
     
     NSString *key = uid.length > 0 ? uid : acc;
     if (key.length >= 2 && !_contactFriendsMap[key]) {
-        HOModelItem *item = _collectedUsersMap[key] ?: [[HOModelItem alloc] init];
+        HOModelItem *item = _collectedUsersMap[key];
+        if (!item) {
+            item = [[HOModelItem alloc] init];
+            item.collectSeq = ++_globalSeqCounter;
+        }
         item.itemId = key;
         item.account = acc ?: key;
         item.name = nick ?: key;
@@ -326,102 +363,155 @@ static NSString *SafeKVCString(id obj, NSString *key) {
     }
 }
 
-#pragma mark - 3. 等级排行榜【从上往下拉刷新 (mj_header) + 页码递增】无限翻页引擎
+#pragma mark - 3. 排行榜【刷新一次 -> 自动跳到最后一行(新用户入榜位置)】核心逻辑
 
-- (void)pullDownRankNextPageOnceOnVC:(UIViewController *)vc {
-    if (!vc) return;
-    _customRankPageCounter += 1;
+// 辅助：将排行榜列表立即滚动到最底部最后一个元素，并采集沿途所有可见 Cell
+- (void)scrollRankViewToVeryBottomAndHarvest:(UIScrollView *)sv {
+    if (!sv) return;
     
-    // 1. 先递增页码 zd_page (offset 0x70)，并将单页数量 zd_size (offset 0x78) 设为 100
-    SafeWriteSwiftInt(vc, 0x70, _customRankPageCounter);
-    SafeWriteSwiftInt(vc, 0x78, 100);
-    
-    UICollectionView *cv = FindCollectionViewInView(vc.view);
-    if (cv) {
-        // 采集当前可见的所有榜单 Cell
+    if ([sv isKindOfClass:[UICollectionView class]]) {
+        UICollectionView *cv = (UICollectionView *)sv;
         for (UICollectionViewCell *cell in cv.visibleCells) {
-            [self harvestFromCellView:cell defaultSource:@"发现-等级排行榜"];
+            [self harvestFromCellView:cell defaultSource:@"排行榜(尾部新用户)"];
         }
-        
-        // 2. 模拟「从上往下拉刷新」视觉偏移 (Pull-Down)
-        [cv setContentOffset:CGPointMake(0, -85) animated:YES];
-        
-        // 3. 触发顶部下拉刷新组件 mj_header
-        id mjHeader = nil;
-        @try { mjHeader = [cv valueForKey:@"mj_header"]; } @catch (NSException *e) {}
-        if (mjHeader) {
-            // 在触发 mj_header 之前和之后都写入递增后的页码，防止 mj_header 回调内部将 zd_page 重置为 1
-            SafeWriteSwiftInt(vc, 0x70, _customRankPageCounter);
-            if ([mjHeader respondsToSelector:NSSelectorFromString(@"beginRefreshing")]) {
-                ((void (*)(id, SEL))objc_msgSend)(mjHeader, NSSelectorFromString(@"beginRefreshing"));
-            } else if ([mjHeader respondsToSelector:NSSelectorFromString(@"executeRefreshingCallback")]) {
-                ((void (*)(id, SEL))objc_msgSend)(mjHeader, NSSelectorFromString(@"executeRefreshingCallback"));
-            }
-            // 延迟 50ms 再次覆写 zd_page，确保网络请求发出前页码是递增后的第 N 页！
-            NSInteger targetPage = _customRankPageCounter;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                SafeWriteSwiftInt(vc, 0x70, targetPage);
-                SafeWriteSwiftInt(vc, 0x78, 100);
-            });
-        }
-        
-        // 4. 兼容系统自带 UIRefreshControl 下拉刷新
-        if (@available(iOS 10.0, *)) {
-            if (cv.refreshControl) {
-                [cv.refreshControl beginRefreshing];
-                [cv.refreshControl sendActionsForControlEvents:UIControlEventValueChanged];
+        NSInteger sections = [cv numberOfSections];
+        if (sections > 0) {
+            NSInteger lastSec = sections - 1;
+            NSInteger items = [cv numberOfItemsInSection:lastSec];
+            if (items > 0) {
+                NSIndexPath *lastIP = [NSIndexPath indexPathForItem:items - 1 inSection:lastSec];
+                @try {
+                    [cv scrollToItemAtIndexPath:lastIP atScrollPosition:UICollectionViewScrollPositionBottom animated:YES];
+                } @catch (NSException *e) {
+                    CGFloat maxOffset = MAX(0, cv.contentSize.height - cv.bounds.size.height + cv.contentInset.bottom);
+                    [cv setContentOffset:CGPointMake(0, maxOffset) animated:YES];
+                }
             }
         }
-        
-        // 5. 同时兼容底部 mj_footer (如果当前分类支持上拉)
-        id mjFooter = nil;
-        @try { mjFooter = [cv valueForKey:@"mj_footer"]; } @catch (NSException *e) {}
-        if (mjFooter) {
-            if ([mjFooter respondsToSelector:NSSelectorFromString(@"resetNoMoreData")]) {
-                ((void (*)(id, SEL))objc_msgSend)(mjFooter, NSSelectorFromString(@"resetNoMoreData"));
+    } else if ([sv isKindOfClass:[UITableView class]]) {
+        UITableView *tv = (UITableView *)sv;
+        for (UITableViewCell *cell in tv.visibleCells) {
+            [self harvestFromCellView:cell defaultSource:@"排行榜(尾部新用户)"];
+        }
+        NSInteger sections = [tv numberOfSections];
+        if (sections > 0) {
+            NSInteger lastSec = sections - 1;
+            NSInteger rows = [tv numberOfRowsInSection:lastSec];
+            if (rows > 0) {
+                NSIndexPath *lastIP = [NSIndexPath indexPathForRow:rows - 1 inSection:lastSec];
+                @try {
+                    [tv scrollToRowAtIndexPath:lastIP atScrollPosition:UITableViewScrollPositionBottom animated:YES];
+                } @catch (NSException *e) {}
             }
-            if ([mjFooter respondsToSelector:NSSelectorFromString(@"beginRefreshing")]) {
-                ((void (*)(id, SEL))objc_msgSend)(mjFooter, NSSelectorFromString(@"beginRefreshing"));
+        }
+    }
+    
+    // 滚动动画结束后（0.4秒后），再采集一次刚刚滚出来的最底部新用户 Cell
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if ([sv isKindOfClass:[UICollectionView class]]) {
+            for (UICollectionViewCell *cell in [(UICollectionView *)sv visibleCells]) {
+                [self harvestFromCellView:cell defaultSource:@"排行榜(尾部新用户)"];
             }
+        }
+        [self updateRankButtonsTitle];
+    });
+}
+
+- (void)updateRankButtonsTitle {
+    if (_rankStepJumpBtn) {
+        [_rankStepJumpBtn setTitle:[NSString stringWithFormat:@"⏬刷新并跳到最后(已采%lu)", (unsigned long)_collectedUsersMap.count] forState:UIControlStateNormal];
+    }
+    if (_rankAutoBtn) {
+        if (_isAutoPagingRank) {
+            [_rankAutoBtn setTitle:[NSString stringWithFormat:@"🛑停止连刷(第%ld页)", (long)_currentRankPage] forState:UIControlStateNormal];
+        } else {
+            [_rankAutoBtn setTitle:@"⚡慢速连刷到底" forState:UIControlStateNormal];
         }
     }
 }
 
-- (void)toggleRankUnlimitedAutoPageOnVC:(UIViewController *)vc {
-    if (_isAutoPagingRank) {
-        _isAutoPagingRank = NO;
+// 核心功能：刷新一次 -> 等待数据返回 -> 自动跳转到最底部最后一名（新用户入榜位置）
+- (void)refreshOnceAndJumpToBottomOnVC:(UIViewController *)vc {
+    if (!vc || !vc.view.window) return;
+    _activeRankVC = vc;
+    _currentRankPage += 1;
+    
+    // 安全通过 Ivar 名称反射更新 zd_page 和 zd_size (若找到真实 ivar 才写，绝不破坏 UIViewController)
+    SafeSetIvarIntByName(vc, "zd_page", _currentRankPage);
+    SafeSetIvarIntByName(vc, "zd_size", 100);
+    
+    UIScrollView *sv = FindRankScrollViewInView(vc.view);
+    if (!sv) return;
+    
+    // 第 1 步：先跳到当前列表的最底部
+    [self scrollRankViewToVeryBottomAndHarvest:sv];
+    
+    // 第 2 步：触发刷新获取下一批用户（优先触发底部 mj_footer 追加更多，若无 mj_footer 则触发 mj_header）
+    id mjFooter = nil;
+    id mjHeader = nil;
+    @try { mjFooter = [sv valueForKey:@"mj_footer"]; } @catch (NSException *e) {}
+    @try { mjHeader = [sv valueForKey:@"mj_header"]; } @catch (NSException *e) {}
+    
+    if (mjFooter) {
+        if ([mjFooter respondsToSelector:NSSelectorFromString(@"resetNoMoreData")]) {
+            ((void (*)(id, SEL))objc_msgSend)(mjFooter, NSSelectorFromString(@"resetNoMoreData"));
+        }
+        if ([mjFooter respondsToSelector:NSSelectorFromString(@"beginRefreshing")]) {
+            ((void (*)(id, SEL))objc_msgSend)(mjFooter, NSSelectorFromString(@"beginRefreshing"));
+        } else if ([mjFooter respondsToSelector:NSSelectorFromString(@"executeRefreshingCallback")]) {
+            ((void (*)(id, SEL))objc_msgSend)(mjFooter, NSSelectorFromString(@"executeRefreshingCallback"));
+        }
+    } else if (mjHeader) {
+        SafeSetIvarIntByName(vc, "zd_page", _currentRankPage);
+        if ([mjHeader respondsToSelector:NSSelectorFromString(@"beginRefreshing")]) {
+            ((void (*)(id, SEL))objc_msgSend)(mjHeader, NSSelectorFromString(@"beginRefreshing"));
+        }
+    }
+    
+    // 第 3 步：等待 1.2 秒网络数据返回并渲染完成后，自动跳转到最新加载出来的最底部（新用户入榜位置）！
+    __weak typeof(self) weakSelf = self;
+    __weak UIScrollView *weakSV = sv;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [weakSelf scrollRankViewToVeryBottomAndHarvest:weakSV];
+    });
+}
+
+- (void)stopAutoPageIfNeeded {
+    _isAutoPagingRank = NO;
+    if (_rankPageTimer) {
         [_rankPageTimer invalidate];
         _rankPageTimer = nil;
-        if (_rankFloatingBtn) {
-            [_rankFloatingBtn setTitle:[NSString stringWithFormat:@"⚡自动下拉翻页(已采%lu)", (unsigned long)_collectedUsersMap.count] forState:UIControlStateNormal];
-            _rankFloatingBtn.backgroundColor = [UIColor systemOrangeColor];
-        }
-        return;
     }
-    
-    _isAutoPagingRank = YES;
-    _activeRankVC = vc;
-    _customRankPageCounter = MAX(1, SafeReadSwiftInt(vc, 0x70));
-    
-    if (_rankFloatingBtn) {
-        [_rankFloatingBtn setTitle:@"🛑停止下拉(采集中...)" forState:UIControlStateNormal];
-        _rankFloatingBtn.backgroundColor = [UIColor systemRedColor];
+    if (_rankAutoBtn) {
+        _rankAutoBtn.backgroundColor = [UIColor systemOrangeColor];
     }
-    
-    [self stepNextRankPageTimerTick];
-    _rankPageTimer = [NSTimer scheduledTimerWithTimeInterval:1.8 target:self selector:@selector(stepNextRankPageTimerTick) userInfo:nil repeats:YES];
+    [self updateRankButtonsTitle];
 }
 
-- (void)stepNextRankPageTimerTick {
-    UIViewController *vc = _activeRankVC;
-    if (!vc || !vc.view.window) {
-        if (_isAutoPagingRank) [self toggleRankUnlimitedAutoPageOnVC:nil];
+- (void)toggleSlowAutoRefreshToBottomOnVC:(UIViewController *)vc {
+    if (_isAutoPagingRank) {
+        [self stopAutoPageIfNeeded];
         return;
     }
-    [self pullDownRankNextPageOnceOnVC:vc];
-    if (_rankFloatingBtn) {
-        [_rankFloatingBtn setTitle:[NSString stringWithFormat:@"🛑第%ld页(已采%lu人)点停", (long)_customRankPageCounter, (unsigned long)_collectedUsersMap.count] forState:UIControlStateNormal];
+    _isAutoPagingRank = YES;
+    _activeRankVC = vc;
+    if (_rankAutoBtn) {
+        _rankAutoBtn.backgroundColor = [UIColor systemRedColor];
     }
+    [self updateRankButtonsTitle];
+    
+    // 立即执行一次“刷新并跳到最后”
+    [self refreshOnceAndJumpToBottomOnVC:vc];
+    // 采用 3.5 秒慢速定时器，留足时间让网络返回并滚到底部，绝不卡死或抢占请求
+    _rankPageTimer = [NSTimer scheduledTimerWithTimeInterval:3.5 target:self selector:@selector(slowAutoTick) userInfo:nil repeats:YES];
+}
+
+- (void)slowAutoTick {
+    if (!_activeRankVC || !_activeRankVC.view.window) {
+        [self stopAutoPageIfNeeded];
+        return;
+    }
+    [self refreshOnceAndJumpToBottomOnVC:_activeRankVC];
 }
 
 #pragma mark - 4. 批量加好友与群发通道
@@ -429,11 +519,12 @@ static NSString *SafeKVCString(id obj, NSString *key) {
     if (!uid || uid.length == 0) return;
     if ([_addedRequestHistory containsObject:uid] || _contactFriendsMap[uid]) return;
     
-    HOModelItem *item = [[HOModelItem alloc] init];
+    HOModelItem *item = _collectedUsersMap[uid] ?: [[HOModelItem alloc] init];
     item.itemId = uid;
     item.account = uid;
     item.name = name ?: uid;
     item.source = source ?: @"群新进成员实时监听";
+    item.collectSeq = ++_globalSeqCounter;
     _collectedUsersMap[uid] = item;
     
     if (_autoAddNewGroupMember) {
@@ -445,7 +536,7 @@ static NSString *SafeKVCString(id obj, NSString *key) {
     if (!user.itemId) return;
     [_addedRequestHistory addObject:user.itemId];
     [self saveSettings];
-    NSLog(@"[海鸥助手] 自动向 %@ (%@) [来源:%@] 发送好友申请: %@", user.name, user.itemId, user.source, verifyMsg);
+    NSLog(@"[海鸥助手] 已向 %@ (%@) [来源:%@] 发送好友申请: %@", user.name, user.itemId, user.source, verifyMsg);
 }
 
 - (void)batchAddFriends:(NSArray<HOModelItem *> *)users verifyMsg:(NSString *)verifyMsg progress:(void(^)(NSInteger current, NSInteger total, NSString *log))progressBlock {
@@ -457,7 +548,7 @@ static NSString *SafeKVCString(id obj, NSString *key) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [self sendFriendApplyForUser:u verifyMsg:verifyMsg];
             if (progressBlock) {
-                progressBlock(i + 1, total, [NSString stringWithFormat:@"[%ld/%ld] 已申请添加好友 -> %@ (%@)", (long)(i+1), (long)total, u.name, u.source]);
+                progressBlock(i + 1, total, [NSString stringWithFormat:@"[%ld/%ld] 已申请加好友 -> %@ (%@)", (long)(i+1), (long)total, u.name, u.source]);
             }
         });
     }
@@ -516,7 +607,7 @@ static NSString *SafeKVCString(id obj, NSString *key) {
 
 - (void)setupUI {
     CGFloat topY = 100;
-    _tabSegment = [[UISegmentedControl alloc] initWithItems:@[@"群发好友(通讯录)", @"群发群聊(独立)", @"采集池(批量加人)"]];
+    _tabSegment = [[UISegmentedControl alloc] initWithItems:@[@"群发好友(通讯录)", @"群发群聊(独立)", @"采集池(新用户优先)"]];
     _tabSegment.frame = CGRectMake(15, topY, self.view.bounds.size.width - 30, 36);
     _tabSegment.selectedSegmentIndex = 0;
     [_tabSegment addTarget:self action:@selector(reloadTabData) forControlEvents:UIControlEventValueChanged];
@@ -533,7 +624,7 @@ static NSString *SafeKVCString(id obj, NSString *key) {
     topY += 84;
     
     CGFloat btnW = (self.view.bounds.size.width - 45) / 4.0;
-    NSArray *titles = @[@"全选", @"反选/清空", @"刷新数据库", @"执行任务"];
+    NSArray *titles = @[@"全选", @"反选/清空", @"刷新数据", @"执行任务"];
     SEL actions[] = {@selector(selectAllItems), @selector(invertSelectItems), @selector(refreshDB), @selector(executeBatchTask)};
     for (int i = 0; i < 4; i++) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -575,10 +666,14 @@ static NSString *SafeKVCString(id obj, NSString *key) {
         }];
         _statusLabel.text = [NSString stringWithFormat:@"【独立群聊列表】共 %lu 个群 (已选 %lu)", (unsigned long)_currentList.count, (unsigned long)[self selectedItems].count];
     } else {
+        // 按 collectSeq 倒序排列：越往后刷出来的尾部新入榜用户排在最前面！
         _currentList = [eng.collectedUsersMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
-            return [a.source compare:b.source];
+            if (a.collectSeq != b.collectSeq) {
+                return a.collectSeq > b.collectSeq ? NSOrderedAscending : NSOrderedDescending;
+            }
+            return [a.name compare:b.name];
         }];
-        _statusLabel.text = [NSString stringWithFormat:@"【群成员+等级榜采集池】共 %lu 人待加好友 (已选 %lu)", (unsigned long)_currentList.count, (unsigned long)[self selectedItems].count];
+        _statusLabel.text = [NSString stringWithFormat:@"【尾部新入榜用户优先】共 %lu 人待加好友 (已选 %lu)", (unsigned long)_currentList.count, (unsigned long)[self selectedItems].count];
     }
     [_tableView reloadData];
 }
@@ -649,9 +744,9 @@ static NSString *SafeKVCString(id obj, NSString *key) {
         eng.autoAddNewGroupMember = !eng.autoAddNewGroupMember;
         [eng saveSettings];
     }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"切换【排行榜无限翻页】开关" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        eng.unlockRankPagination = !eng.unlockRankPagination;
-        [eng saveSettings];
+    [ac addAction:[UIAlertAction actionWithTitle:@"清空采集池重新采集" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [eng.collectedUsersMap removeAllObjects];
+        [self reloadTabData];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"保存配置" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         eng.defaultVerifyMsg = ac.textFields[0].text ?: @"你好";
@@ -674,7 +769,7 @@ static NSString *SafeKVCString(id obj, NSString *key) {
     }
     HOModelItem *item = _currentList[indexPath.row];
     cell.textLabel.text = [NSString stringWithFormat:@"%@ %@", item.isSelected ? @"☑️" : @"⬜️", item.name];
-    cell.detailTextLabel.text = [NSString stringWithFormat:@"账号/ID: %@  |  来源: %@", item.account ?: item.itemId, item.source];
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"账号/ID: %@  |  %@", item.account ?: item.itemId, item.source];
     cell.accessoryType = item.isSelected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
     return cell;
 }
@@ -700,11 +795,9 @@ static void SwizzleInstanceMethod(Class cls, SEL origSel, SEL swizSel, IMP newIm
 }
 
 // ---------------- 0. 拦截 UITableView dequeueReusableCellWithIdentifier:forIndexPath: ----------------
-// 彻底解决崩溃日志 (source: 5) 中由于 shifted indexPath 与 UIKit 当前正在创建的 cell indexPath 不一致引发的 SIGABRT 闪退！
 static UITableViewCell *(*orig_tv_dequeueForIndexPath)(UITableView *, SEL, NSString *, NSIndexPath *);
 static UITableViewCell *hook_tv_dequeueForIndexPath(UITableView *self, SEL _cmd, NSString *identifier, NSIndexPath *indexPath) {
     if (self == g_currentMineTableView && g_currentRealRequestIndexPath != nil) {
-        // 将传给 UIKit 底层校验的 indexPath 修正回当前真实渲染的 indexPath
         return orig_tv_dequeueForIndexPath(self, _cmd, identifier, g_currentRealRequestIndexPath);
     }
     return orig_tv_dequeueForIndexPath(self, _cmd, identifier, indexPath);
@@ -765,7 +858,6 @@ static UITableViewCell *hook_mine_cellForRowAtIndexPath(id self, SEL _cmd, UITab
                 return cell;
             } else if (indexPath.row > insertRow) {
                 NSIndexPath *shifted = [NSIndexPath indexPathForRow:indexPath.row - 1 inSection:indexPath.section];
-                // 记录当前真实请求的 tableView 与 indexPath，供 dequeueReusableCellWithIdentifier:forIndexPath: 修正
                 g_currentMineTableView = tableView;
                 g_currentRealRequestIndexPath = indexPath;
                 UITableViewCell *origCell = orig_mine_cellForRowAtIndexPath(self, _cmd, tableView, shifted);
@@ -823,7 +915,7 @@ static void hook_mine_didSelectRowAtIndexPath(id self, SEL _cmd, UITableView *ta
     orig_mine_didSelectRowAtIndexPath(self, _cmd, tableView, indexPath);
 }
 
-// ---------------- 2. Hook 等级排行榜 (支持手动下拉翻下一页 + 一键全自动下拉翻页采集) ----------------
+// ---------------- 2. Hook 等级排行榜 (双按钮：单次刷新跳到最后 + 慢速连刷到底) ----------------
 
 static void (*orig_rank_viewDidAppear)(id, SEL, BOOL);
 static void hook_rank_viewDidAppear(id self, SEL _cmd, BOOL animated) {
@@ -831,56 +923,70 @@ static void hook_rank_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     
     UIViewController *vc = (UIViewController *)self;
     [HOMassEngine shared].activeRankVC = vc;
-    SafeWriteSwiftInt(self, 0x78, 100); // 单页条数设为 100
+    SafeSetIvarIntByName(self, "zd_size", 100);
     
-    UIButton *btn = [vc.view viewWithTag:99881];
-    if (!btn) {
-        btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        btn.tag = 99881;
-        btn.frame = CGRectMake(vc.view.bounds.size.width - 175, 10, 165, 36);
-        btn.backgroundColor = [UIColor systemOrangeColor];
-        [btn setTitle:[NSString stringWithFormat:@"⚡自动下拉翻页(已采%lu)", (unsigned long)[HOMassEngine shared].collectedUsersMap.count] forState:UIControlStateNormal];
-        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-        btn.layer.cornerRadius = 18;
-        btn.layer.zPosition = 9999;
-        [btn addTarget:self action:NSSelectorFromString(@"ho_onTapUnlimitedRankBtn:") forControlEvents:UIControlEventTouchUpInside];
-        [vc.view addSubview:btn];
+    CGFloat viewW = vc.view.bounds.size.width;
+    
+    // 按钮 1：刷新一次并自动跳转到最后一行（新入榜用户位置）
+    UIButton *stepBtn = [vc.view viewWithTag:99881];
+    if (!stepBtn) {
+        stepBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        stepBtn.tag = 99881;
+        stepBtn.frame = CGRectMake(12, 8, viewW * 0.56, 34);
+        stepBtn.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.92];
+        [stepBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        stepBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        stepBtn.layer.cornerRadius = 17;
+        stepBtn.layer.zPosition = 9999;
+        [stepBtn addTarget:self action:NSSelectorFromString(@"ho_onTapStepJumpBottomBtn:") forControlEvents:UIControlEventTouchUpInside];
+        [vc.view addSubview:stepBtn];
     }
-    [vc.view bringSubviewToFront:btn];
-    [HOMassEngine shared].rankFloatingBtn = btn;
+    [vc.view bringSubviewToFront:stepBtn];
+    [HOMassEngine shared].rankStepJumpBtn = stepBtn;
     
-    UICollectionView *cv = FindCollectionViewInView(vc.view);
-    if (cv) {
-        for (UICollectionViewCell *cell in cv.visibleCells) {
+    // 按钮 2：慢速连续刷新到底部开关 (3.5秒/次)
+    UIButton *autoBtn = [vc.view viewWithTag:99882];
+    if (!autoBtn) {
+        autoBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        autoBtn.tag = 99882;
+        autoBtn.frame = CGRectMake(viewW * 0.56 + 18, 8, viewW * 0.44 - 30, 34);
+        autoBtn.backgroundColor = [[UIColor systemOrangeColor] colorWithAlphaComponent:0.92];
+        [autoBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        autoBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        autoBtn.layer.cornerRadius = 17;
+        autoBtn.layer.zPosition = 9999;
+        [autoBtn addTarget:self action:NSSelectorFromString(@"ho_onTapSlowAutoRankBtn:") forControlEvents:UIControlEventTouchUpInside];
+        [vc.view addSubview:autoBtn];
+    }
+    [vc.view bringSubviewToFront:autoBtn];
+    [HOMassEngine shared].rankAutoBtn = autoBtn;
+    
+    // 初始采集一次当前可见 Cell
+    UIScrollView *sv = FindRankScrollViewInView(vc.view);
+    if ([sv isKindOfClass:[UICollectionView class]]) {
+        for (UICollectionViewCell *cell in [(UICollectionView *)sv visibleCells]) {
             [[HOMassEngine shared] harvestFromCellView:cell defaultSource:@"发现-等级排行榜"];
         }
-        [btn setTitle:[NSString stringWithFormat:@"⚡自动下拉翻页(已采%lu)", (unsigned long)[HOMassEngine shared].collectedUsersMap.count] forState:UIControlStateNormal];
     }
+    [[HOMassEngine shared] updateRankButtonsTitle];
 }
 
-static void ho_onTapUnlimitedRankBtn_imp(id self, SEL _cmd, UIButton *sender) {
-    [[HOMassEngine shared] toggleRankUnlimitedAutoPageOnVC:(UIViewController *)self];
+static void (*orig_rank_viewWillDisappear)(id, SEL, BOOL);
+static void hook_rank_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
+    // 离开排行榜页面时立即停止定时器，清理弱引用，确保返回时干净释放不闪退！
+    [[HOMassEngine shared] stopAutoPageIfNeeded];
+    if ([HOMassEngine shared].activeRankVC == self) {
+        [HOMassEngine shared].activeRankVC = nil;
+    }
+    orig_rank_viewWillDisappear(self, _cmd, animated);
 }
 
-// 当用户自己手动从上往下拉刷新排行榜时，也自动递增页码 zd_page (offset 0x70)，让手动下拉直接变成“翻下一页”！
-static void (*orig_mjHeader_beginRefreshing)(id, SEL);
-static void hook_mjHeader_beginRefreshing(id self, SEL _cmd) {
-    UIViewController *rankVC = [HOMassEngine shared].activeRankVC;
-    if (rankVC && rankVC.view.window && [HOMassEngine shared].unlockRankPagination) {
-        [HOMassEngine shared].customRankPageCounter += 1;
-        NSInteger nextP = [HOMassEngine shared].customRankPageCounter;
-        SafeWriteSwiftInt(rankVC, 0x70, nextP);
-        SafeWriteSwiftInt(rankVC, 0x78, 100);
-        orig_mjHeader_beginRefreshing(self, _cmd);
-        // 防止下拉回调内部把 zd_page 重置为 1，在回调启动瞬间再次把页码写回 nextP
-        SafeWriteSwiftInt(rankVC, 0x70, nextP);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            SafeWriteSwiftInt(rankVC, 0x70, nextP);
-        });
-        return;
-    }
-    orig_mjHeader_beginRefreshing(self, _cmd);
+static void ho_onTapStepJumpBottomBtn_imp(id self, SEL _cmd, UIButton *sender) {
+    [[HOMassEngine shared] refreshOnceAndJumpToBottomOnVC:(UIViewController *)self];
+}
+
+static void ho_onTapSlowAutoRankBtn_imp(id self, SEL _cmd, UIButton *sender) {
+    [[HOMassEngine shared] toggleSlowAutoRefreshToBottomOnVC:(UIViewController *)self];
 }
 
 static void hook_rank_clickUpgrade(id self, SEL _cmd) {
@@ -891,11 +997,10 @@ static UICollectionViewCell *(*orig_rank_cellForItem)(id, SEL, UICollectionView 
 static UICollectionViewCell *hook_rank_cellForItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
     UICollectionViewCell *cell = orig_rank_cellForItem(self, _cmd, cv, indexPath);
     if (cell) {
+        NSInteger rowNum = indexPath.item + 1;
         dispatch_async(dispatch_get_main_queue(), ^{
-            [[HOMassEngine shared] harvestFromCellView:cell defaultSource:@"发现-等级排行榜"];
-            if ([HOMassEngine shared].rankFloatingBtn && ![HOMassEngine shared].isAutoPagingRank) {
-                [[HOMassEngine shared].rankFloatingBtn setTitle:[NSString stringWithFormat:@"⚡自动下拉翻页(已采%lu)", (unsigned long)[HOMassEngine shared].collectedUsersMap.count] forState:UIControlStateNormal];
-            }
+            [[HOMassEngine shared] harvestFromCellView:cell defaultSource:[NSString stringWithFormat:@"排行榜第%ld位", (long)rowNum]];
+            [[HOMassEngine shared] updateRankButtonsTitle];
         });
     }
     return cell;
@@ -937,7 +1042,7 @@ static void hook_chatMgr_reciveMsg(id self, SEL _cmd, id messageObj, BOOL needRe
 __attribute__((constructor))
 static void HaiouMassHelperInit(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 0. 挂载 UITableView dequeue 修正钩子 (彻底消灭 source: 5 的 indexPath 不一致崩溃)
+        // 0. 挂载 UITableView dequeue 修正钩子
         Class tvCls = [UITableView class];
         SEL deqSel = @selector(dequeueReusableCellWithIdentifier:forIndexPath:);
         orig_tv_dequeueForIndexPath = (void *)method_getImplementation(class_getInstanceMethod(tvCls, deqSel));
@@ -959,10 +1064,11 @@ static void HaiouMassHelperInit(void) {
             SwizzleInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:), NSSelectorFromString(@"ho_tableView:didSelectRowAtIndexPath:"), (IMP)hook_mine_didSelectRowAtIndexPath, NULL);
         }
         
-        // 2. 挂载「等级排行」下拉刷新翻页与自动采集
+        // 2. 挂载「等级排行」无闪退刷新跳到底部与自动采集
         Class rankItemCls = objc_getClass("_TtC7ZhengDu25ZDGlobalTopItemController");
         if (rankItemCls) {
-            class_addMethod(rankItemCls, NSSelectorFromString(@"ho_onTapUnlimitedRankBtn:"), (IMP)ho_onTapUnlimitedRankBtn_imp, "v@:@");
+            class_addMethod(rankItemCls, NSSelectorFromString(@"ho_onTapStepJumpBottomBtn:"), (IMP)ho_onTapStepJumpBottomBtn_imp, "v@:@");
+            class_addMethod(rankItemCls, NSSelectorFromString(@"ho_onTapSlowAutoRankBtn:"), (IMP)ho_onTapSlowAutoRankBtn_imp, "v@:@");
             
             Method vdaMethod = class_getInstanceMethod(rankItemCls, @selector(viewDidAppear:));
             orig_rank_viewDidAppear = (void *)method_getImplementation(vdaMethod);
@@ -970,21 +1076,16 @@ static void HaiouMassHelperInit(void) {
                 SwizzleInstanceMethod(rankItemCls, @selector(viewDidAppear:), NSSelectorFromString(@"ho_rank_viewDidAppear:"), (IMP)hook_rank_viewDidAppear, NULL);
             }
             
+            Method vwdMethod = class_getInstanceMethod(rankItemCls, @selector(viewWillDisappear:));
+            orig_rank_viewWillDisappear = (void *)method_getImplementation(vwdMethod);
+            if (!class_addMethod(rankItemCls, @selector(viewWillDisappear:), (IMP)hook_rank_viewWillDisappear, method_getTypeEncoding(vwdMethod))) {
+                SwizzleInstanceMethod(rankItemCls, @selector(viewWillDisappear:), NSSelectorFromString(@"ho_rank_viewWillDisappear:"), (IMP)hook_rank_viewWillDisappear, NULL);
+            }
+            
             SwizzleInstanceMethod(rankItemCls, NSSelectorFromString(@"zd_clickUpgrade"), NSSelectorFromString(@"ho_zd_clickUpgrade"), (IMP)hook_rank_clickUpgrade, NULL);
             
             orig_rank_cellForItem = (void *)method_getImplementation(class_getInstanceMethod(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:)));
             SwizzleInstanceMethod(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:), NSSelectorFromString(@"ho_collectionView:cellForItemAtIndexPath:"), (IMP)hook_rank_cellForItem, NULL);
-        }
-        
-        // 拦截 MJRefreshComponent (mj_header) 的 beginRefreshing，实现无论手动下拉还是自动下拉都翻下一页
-        Class mjCompCls = objc_getClass("MJRefreshComponent");
-        if (mjCompCls) {
-            SEL beginSel = NSSelectorFromString(@"beginRefreshing");
-            Method m = class_getInstanceMethod(mjCompCls, beginSel);
-            if (m) {
-                orig_mjHeader_beginRefreshing = (void *)method_getImplementation(m);
-                SwizzleInstanceMethod(mjCompCls, beginSel, NSSelectorFromString(@"ho_mj_beginRefreshing"), (IMP)hook_mjHeader_beginRefreshing, NULL);
-            }
         }
         
         // 3. 挂载群成员自动采集
