@@ -119,6 +119,74 @@ jobs:
           print("fixed", count, "address-of property expression(s)")
           PY
 
+      - name: Fix dot-syntax mutableCopy on id
+        run: |
+          # msg.mutableCopy（msg 为 id）在点语法下被当成属性访问而报错，
+          # 规范化为 [msg mutableCopy]（幂等）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          new, n = re.subn(r'(?<![\w.])([A-Za-z_]\w*)\.mutableCopy\b(?!\s*:)', r'[\1 mutableCopy]', s)
+          if n:
+              p.write_text(new)
+          print("fixed", n, "dot-syntax mutableCopy")
+          PY
+
+      - name: Move class interfaces before first use
+        run: |
+          # 顶层 @interface X : Super ... @end 若出现在其首次使用之后，
+          # 会报 "unknown type name 'X'"。自动把该声明块移动到（首次使用所在的）
+          # 顶层块之前（幂等）。注意不能插到方法体内部，否则 @interface 非法。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          lines = p.read_text().split("\n")
+
+          def find_blocks():
+              blocks, i = [], 0
+              while i < len(lines):
+                  m = re.match(r'^@interface\s+([A-Za-z_]\w*)\s*:\s*\S', lines[i])
+                  if m:
+                      j = i
+                      while j < len(lines) and lines[j].strip() != '@end':
+                          j += 1
+                      blocks.append((m.group(1), i, j))
+                      i = j + 1
+                  else:
+                      i += 1
+              return blocks
+
+          def enclosing_start(k):
+              for t in range(k, -1, -1):
+                  if re.match(r'^(@implementation|@interface|%hook)\b', lines[t]):
+                      return t
+              return 0
+
+          moved = []
+          for _ in range(20):
+              did = False
+              for name, s, e in find_blocks():
+                  first_use = None
+                  for k in range(0, s):
+                      if re.search(r'\b%s\b' % re.escape(name), lines[k]):
+                          first_use = k
+                          break
+                  if first_use is not None:
+                      target = enclosing_start(first_use)
+                      block = lines[s:e+1]
+                      del lines[s:e+1]
+                      lines[target:target] = block
+                      moved.append(name)
+                      did = True
+                      break
+              if not did:
+                  break
+          if moved:
+              p.write_text("\n".join(lines))
+          print("moved interfaces:", moved)
+          PY
+
       - name: Build dylib
         run: make -j"$(sysctl -n hw.ncpu)"
 

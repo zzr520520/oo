@@ -139,7 +139,7 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
                 // 修改当前缓存消息的目标会话 ID 为当前遍历的目标
                 id msg = self.pendingForwardMessage;
                 [msg setValue:t.targetId forKey:@"chatId"];
-                [msg.mutableCopy setValue:t.targetId forKey:@"toUserId"];
+                [[msg mutableCopy] setValue:t.targetId forKey:@"toUserId"];
                 
                 SEL sharedSel = NSSelectorFromString(@"shared") ?: NSSelectorFromString(@"sharedInstance");
                 if ([msgMgrClass respondsToSelector:sharedSel]) {
@@ -205,6 +205,13 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 // 响应气泡菜单点击事件
 @interface UIResponder (HOMassBubble)
 @end
+@interface HOMassAssistantController : UIViewController <UITableViewDelegate, UITableViewDataSource>
+@property (nonatomic, strong) UISegmentedControl *segment;
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) NSMutableArray<HOMassTargetItem *> *currentShowList;
+@property (nonatomic, strong) NSMutableSet<NSString *> *selectedIds;
+@end
 @implementation UIResponder (HOMassBubble)
 - (void)ho_handleBubbleMassForward:(id)sender {
     // 捕获当前选中的气泡消息模型
@@ -223,13 +230,6 @@ typedef NS_ENUM(NSInteger, HOMassTargetType) {
 // ==========================================
 // 4. 群发助手面板 UI
 // ==========================================
-@interface HOMassAssistantController : UIViewController <UITableViewDelegate, UITableViewDataSource>
-@property (nonatomic, strong) UISegmentedControl *segment;
-@property (nonatomic, strong) UITableView *tableView;
-@property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) NSMutableArray<HOMassTargetItem *> *currentShowList;
-@property (nonatomic, strong) NSMutableSet<NSString *> *selectedIds;
-@end
 
 @implementation HOMassAssistantController
 
