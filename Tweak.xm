@@ -256,7 +256,7 @@ static NSInteger SGSectionCount(id object, UITableView *tableView) {
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     NSInteger sections = SGSectionCount(self, tableView);
-    NSInteger hookedRows = [self tableView:tableView numberOfRowsInSection:indexPath.section];
+    NSInteger hookedRows = [(id)self tableView:tableView numberOfRowsInSection:indexPath.section];
     BOOL isInjectedRow = (sections > 0 && indexPath.section == sections - 1 && indexPath.row == hookedRows - 1);
     if (isInjectedRow) {
         static NSString *reuseID = @"SGGroupMassAssistantEntry";
@@ -275,13 +275,13 @@ static NSInteger SGSectionCount(id object, UITableView *tableView) {
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     NSInteger sections = SGSectionCount(self, tableView);
-    NSInteger hookedRows = [self tableView:tableView numberOfRowsInSection:indexPath.section];
+    NSInteger hookedRows = [(id)self tableView:tableView numberOfRowsInSection:indexPath.section];
     BOOL isInjectedRow = (sections > 0 && indexPath.section == sections - 1 && indexPath.row == hookedRows - 1);
     if (isInjectedRow) {
         [tableView deselectRowAtIndexPath:indexPath animated:YES];
         SGRecipientPickerController *picker = [[SGRecipientPickerController alloc] init];
         UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:picker];
-        [self presentViewController:navigation animated:YES completion:nil];
+        [(id)self presentViewController:navigation animated:YES completion:nil];
         return;
     }
     %orig;

@@ -204,6 +204,37 @@ jobs:
           print("moved interfaces:", moved)
           PY
 
+      - name: Cast self in %hook of undeclared classes
+        run: |
+          # %hook 一个未在文件中声明 @interface 的类时，self 的类型只是前置声明，
+          # 对它发消息会报 "receiver type 'X' ... is a forward declaration"。
+          # 把这些 [self ...] / [self.xxx] 转成 [(id)self ...]（幂等）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          lines = p.read_text().split("\n")
+          declared = set(re.findall(r'^@interface\s+([A-Za-z_]\w*)', "\n".join(lines), re.M))
+          count = 0
+          i = 0
+          while i < len(lines):
+              m = re.match(r'^%hook\s+([A-Za-z_]\w*)', lines[i])
+              if m:
+                  cls = m.group(1)
+                  j = i
+                  while j < len(lines) and not re.match(r'^%end', lines[j]):
+                      j += 1
+                  if cls not in declared:
+                      for k in range(i, j+1):
+                          lines[k], n1 = re.subn(r'\[self(?=[ .\]])', '[(id)self', lines[k])
+                          count += n1
+                  i = j + 1
+              else:
+                  i += 1
+          if count:
+              p.write_text("\n".join(lines))
+          print("casted self in", count, "place(s)")
+          PY
+
       - name: Build dylib
         run: make -j"$(sysctl -n hw.ncpu)"
 
