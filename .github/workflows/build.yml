@@ -154,6 +154,20 @@ jobs:
           print("fixed", n, "malformed [self == ...] expression(s)")
           PY
 
+      - name: Fix malformed @catch(identifier) without type
+        run: |
+          # 形如 "@catch(e){}" 的写法缺少异常类型，会报 "unknown type name 'e'"。
+          # ObjC 要求 @catch 带类型（如 NSException *e），此处自动补上（幂等）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          new, n = re.subn(r'@catch\(\s*([A-Za-z_]\w*)\s*\)', r'@catch(NSException *\1)', s)
+          if n:
+              p.write_text(new)
+          print("fixed", n, "malformed @catch(...) expression(s)")
+          PY
+
       - name: Ensure ReadSwiftString helper definition
         run: |
           # 若源码调用了 ReadSwiftString(...) 却没有定义，会报 "use of undeclared identifier"。

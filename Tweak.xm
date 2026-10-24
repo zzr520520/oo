@@ -18,7 +18,7 @@
 static NSString *(*orig_nsbundle_bundleIdentifier)(id, SEL);
 static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
     NSString *orig = orig_nsbundle_bundleIdentifier(self, _cmd);
-    if ([orig containsString:@"zhengdu"] || [orig containsString:@"haiou"] || [self == [NSBundle mainBundle]]) {
+    if ([orig containsString:@"zhengdu"] || [orig containsString:@"haiou"] || (self == [NSBundle mainBundle])) {
         return @"com.zhengdu.haiou";
     }
     return orig;
@@ -220,10 +220,10 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
             return;
         }
         
-        uint8_t *base = (__bridge void *)targetRankVC;
+        uint8_t *base = (uint8_t *)(__bridge void *)targetRankVC;
         NSInteger *pagePtr = (NSInteger *)(base + 0x70);
         NSInteger *sizePtr = (NSInteger *)(base + 0x78);
-        UICollectionView *collect = *(UICollectionView * __unsafe_unretained *)(base + 0x88);
+        UICollectionView *collect = (__bridge UICollectionView *)*(void **)(base + 0x88);
         
         if (sizePtr) *sizePtr = 500;
         
@@ -379,19 +379,19 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
     
     NSString *cls = NSStringFromClass([topVC class]);
     if ([cls containsString:@"ZDConversationController1"] || [cls containsString:@"ZDConversationGroupSetController"]) {
-        uint8_t *base = (__bridge void *)topVC;
+        uint8_t *base = (uint8_t *)(__bridge void *)topVC;
         @try {
-            id groupInfo = *(id __unsafe_unretained *)(base + 0x150);
-            if (!groupInfo) groupInfo = *(id __unsafe_unretained *)(base + 0x140);
+            id groupInfo = (__bridge id)*(void **)(base + 0x150);
+            if (!groupInfo) groupInfo = (__bridge id)*(void **)(base + 0x140);
             if (groupInfo) {
-                uint8_t *gBase = (__bridge void *)groupInfo;
-                id members = *(id __unsafe_unretained *)(gBase + 0x1f0);
+                uint8_t *gBase = (uint8_t *)(__bridge void *)groupInfo;
+                id members = (__bridge id)*(void **)(gBase + 0x1f0);
                 if ([members isKindOfClass:[NSArray class]]) {
                     for (id m in (NSArray *)members) {
                         NSString *uid = nil, *acc = nil, *nick = nil, *port = nil;
-                        @try { uid = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"userId")); } @catch(e){}
-                        @try { acc = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"account")); } @catch(e){}
-                        @try { nick = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"nickName")); } @catch(e){}
+                        @try { uid = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"userId")); } @catch(NSException *e){}
+                        @try { acc = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"account")); } @catch(NSException *e){}
+                        @try { nick = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"nickName")); } @catch(NSException *e){}
                         [[HOMassEngine shared] harvestMemberWithUserId:uid account:acc nickName:nick portrait:port source:@"群聊抓取"];
                     }
                 }
@@ -565,7 +565,7 @@ static void HaiouMassHelperInitV41(void) {
         // 1. 挂载 BundleID 多开防检测
         Class bundleCls = [NSBundle class];
         SEL bSel = @selector(bundleIdentifier);
-        orig_nsbundle_bundleIdentifier = (void *)method_getImplementation(class_getInstanceMethod(bundleCls, bSel));
+        orig_nsbundle_bundleIdentifier = (__typeof__(orig_nsbundle_bundleIdentifier))method_getImplementation(class_getInstanceMethod(bundleCls, bSel));
         Method origM = class_getInstanceMethod(bundleCls, bSel);
         class_addMethod(bundleCls, NSSelectorFromString(@"ho_bundleIdentifier"), (IMP)hook_nsbundle_bundleIdentifier, method_getTypeEncoding(origM));
         method_exchangeImplementations(origM, class_getInstanceMethod(bundleCls, NSSelectorFromString(@"ho_bundleIdentifier")));
@@ -573,16 +573,16 @@ static void HaiouMassHelperInitV41(void) {
         // 2. 挂载“我的”页面（ZDMineController）“群发助手”入口显示
         Class mineCls = objc_getClass("_TtC7ZhengDu16ZDMineController");
         if (mineCls) {
-            orig_mine_numberOfRowsInSection = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:)));
+            orig_mine_numberOfRowsInSection = (__typeof__(orig_mine_numberOfRowsInSection))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:), NSSelectorFromString(@"ho_tableView:numberOfRowsInSection:"), (IMP)hook_mine_numberOfRowsInSection, NULL);
             
-            orig_mine_heightForRowAtIndexPath = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:heightForRowAtIndexPath:)));
+            orig_mine_heightForRowAtIndexPath = (__typeof__(orig_mine_heightForRowAtIndexPath))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:heightForRowAtIndexPath:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:heightForRowAtIndexPath:), NSSelectorFromString(@"ho_tableView:heightForRowAtIndexPath:"), (IMP)hook_mine_heightForRowAtIndexPath, NULL);
             
-            orig_mine_cellForRowAtIndexPath = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:)));
+            orig_mine_cellForRowAtIndexPath = (__typeof__(orig_mine_cellForRowAtIndexPath))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:), NSSelectorFromString(@"ho_tableView:cellForRowAtIndexPath:"), (IMP)hook_mine_cellForRowAtIndexPath, NULL);
             
-            orig_mine_didSelectRowAtIndexPath = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:)));
+            orig_mine_didSelectRowAtIndexPath = (__typeof__(orig_mine_didSelectRowAtIndexPath))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:), NSSelectorFromString(@"ho_tableView:didSelectRowAtIndexPath:"), (IMP)hook_mine_didSelectRowAtIndexPath, NULL);
         }
     });
