@@ -9,12 +9,47 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 
+#pragma mark - ==================== 0. Swift String 内存安全读取 ====================
+// 从对象内存偏移处读取字符串：兼容 Swift 5 Small String 与 Large String（桥接函数）。
+static NSString *ReadSwiftString(id obj, ptrdiff_t offset) {
+    if (!obj) return nil;
+    @try {
+        uint8_t *base = (uint8_t *)(__bridge void *)obj;
+        uint64_t word0 = *(uint64_t *)(base + offset);
+        uint64_t word1 = *(uint64_t *)(base + offset + 8);
+        if (word0 == 0 && word1 == 0) return nil;
+        uint8_t topByte = (uint8_t)(word1 >> 56);
+        if ((topByte & 0xE0) == 0xE0) {
+            NSUInteger len = topByte & 0x0F;
+            if (len > 0 && len <= 15) {
+                char buf[16] = {0};
+                memcpy(buf, base + offset, len);
+                return [[NSString alloc] initWithBytes:buf length:len encoding:NSUTF8StringEncoding];
+            }
+            return @"";
+        }
+        typedef id (*SwiftStringToNSStringFunc)(uint64_t, uint64_t);
+        static SwiftStringToNSStringFunc bridgeFunc = NULL;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            void *sym = dlsym(RTLD_DEFAULT, "$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF");
+            if (!sym) sym = dlsym(RTLD_DEFAULT, "_$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF");
+            bridgeFunc = (SwiftStringToNSStringFunc)sym;
+        });
+        if (bridgeFunc && (word1 != 0)) {
+            id nsStr = bridgeFunc(word0, word1);
+            if ([nsStr isKindOfClass:[NSString class]]) return (NSString *)nsStr;
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
 #pragma mark - ==================== 1. 防多开 BundleID 官方标识模拟 ====================
 // 强制让海鸥无论在什么多开或签名环境下，都向系统返回官方标准 BundleID
 static NSString *(*orig_nsbundle_bundleIdentifier)(id, SEL);
 static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
     NSString *orig = orig_nsbundle_bundleIdentifier(self, _cmd);
-    if ([orig containsString:@"zhengdu"] || [orig containsString:@"haiou"] || [self == [NSBundle mainBundle]]) {
+    if ([orig containsString:@"zhengdu"] || [orig containsString:@"haiou"] || (self == [NSBundle mainBundle])) {
         return @"com.zhengdu.haiou";
     }
     return orig;
@@ -203,11 +238,11 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
     }
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        uint8_t *base = (__bridge void *)rankVC;
+        uint8_t *base = (uint8_t *)(__bridge void *)rankVC;
         // 逆向报告 5.2 节：ZDGlobalTopItemController 偏移 0x70 = zd_page, 0x78 = zd_size, 0x88 = zd_collect
         NSInteger *pagePtr = (NSInteger *)(base + 0x70);
         NSInteger *sizePtr = (NSInteger *)(base + 0x78);
-        UICollectionView *collect = *(UICollectionView * __unsafe_unretained *)(base + 0x88);
+        UICollectionView *collect = (__bridge UICollectionView *)*(void **)(base + 0x88);
         
         if (sizePtr) *sizePtr = 500;
         
@@ -376,13 +411,13 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
         NSString *cls = NSStringFromClass([vc class]);
         if ([cls containsString:@"ZDConversationController1"]) {
             found = YES;
-            uint8_t *base = (__bridge void *)vc;
+            uint8_t *base = (uint8_t *)(__bridge void *)vc;
             // 逆向报告 3.10 / 4.1 节：尝试直接读取当前会话的群成员数组
             @try {
-                id groupInfo = *(id __unsafe_unretained *)(base + 0x150);
+                id groupInfo = (__bridge id)*(void **)(base + 0x150);
                 if (groupInfo) {
-                    uint8_t *gBase = (__bridge void *)groupInfo;
-                    id members = *(id __unsafe_unretained *)(gBase + 0x1f0);
+                    uint8_t *gBase = (uint8_t *)(__bridge void *)groupInfo;
+                    id members = (__bridge id)*(void **)(gBase + 0x1f0);
                     if ([members isKindOfClass:[NSArray class]]) {
                         for (id m in (NSArray *)members) {
                             NSString *uid = ReadSwiftString(m, 0x40);
@@ -491,7 +526,7 @@ static void HaiouMassHelperInitV4(void) {
         // 1. 挂载防多开 BundleID 标识模拟
         Class bundleCls = [NSBundle class];
         SEL bSel = @selector(bundleIdentifier);
-        orig_nsbundle_bundleIdentifier = (void *)method_getImplementation(class_getInstanceMethod(bundleCls, bSel));
+        orig_nsbundle_bundleIdentifier = (__typeof__(orig_nsbundle_bundleIdentifier))method_getImplementation(class_getInstanceMethod(bundleCls, bSel));
         Method origM = class_getInstanceMethod(bundleCls, bSel);
         class_addMethod(bundleCls, NSSelectorFromString(@"ho_bundleIdentifier"), (IMP)hook_nsbundle_bundleIdentifier, method_getTypeEncoding(origM));
         method_exchangeImplementations(origM, class_getInstanceMethod(bundleCls, NSSelectorFromString(@"ho_bundleIdentifier")));
