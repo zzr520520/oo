@@ -73,14 +73,15 @@ jobs:
 
       - name: Fix void* to function pointer casts
         run: |
-          # Tweak.xm 中的 orig_X = (void *)method_getImplementation(...) 在 ObjC++ 下是错误：
-          # void* 不能直接赋给函数指针。此处精确改写为目标变量自身的类型。
+          # 形如 "orig_X = (void *)method_getImplementation(...)" 或
+          # "orig_X = (void *)SafeSwizzleInstanceMethod(...)" 在 ObjC++ 下是错误：
+          # void* 不能直接赋给函数指针。此处通用改写为目标变量自身的类型（幂等）。
           python3 - <<'PY'
           import re, pathlib
           p = pathlib.Path("Tweak.xm")
           s = p.read_text()
-          new, n = re.subn(r'([A-Za-z_]\w*)\s*=\s*\(void \*\)method_getImplementation\(',
-                           r'\1 = (__typeof__(\1))method_getImplementation(', s)
+          new, n = re.subn(r'([A-Za-z_]\w*)\s*=\s*\(void \*\)(\w+\()',
+                           r'\1 = (__typeof__(\1))\2', s)
           if n:
               p.write_text(new)
           print("rewrote", n)
