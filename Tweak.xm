@@ -1,12 +1,11 @@
 //
 //  HaiouMassHelper.m
-//  海鸥 3.2.9 (Build 20261022) 终极稳定版 v5.0
-//  基于最新崩溃日志 (source: 15) 与《全量逆向分析报告_3》(source: 14) 修复:
-//  1. 【彻底屏蔽开屏广告】：拦截 ZDOpenScreenAdvController、ZDBUAdSetUp、CSJSplashAd、ABUSplashAd、GMSplashAd、BUSplashAd，秒进主页无任何广告
-//  2. 【修复启动 12 秒闪退】：移除破坏 Swift 字典桥接的 infoDictionary Hook，安全伪装官方 BundleID "com.zhengdu.haiou"
-//  3. 【零闪退“我的”页面入口】：在“海鸥助手”右侧内嵌按钮 + 表尾大按钮，绝不修改原表行数，杜绝数组越界
-//  4. 【动态 Ivar 偏移强制群主】：使用 ivar_getOffset 真实物理偏移解锁群主权限、关闭群保护、开启群成员列表
-//  5. 【内置排行榜人员抓取接口 + 真实头像 + 纯海鸥号】：一键抓取日榜/周榜/总榜，带对方真实头像，剔除等级数字，点击直接填入纯海鸥号加人
+//  海鸥 3.2.9 (Build 20261022) 终极稳定版 v6.0
+//  修复说明:
+//  1. 【彻底修复打开即闪退 (source: 16)】：使用 dispatch_once 严防重复 Hook 导致的无限递归栈溢出 (STACK GUARD)
+//  2. 【彻底修复 12秒广告闪退 (source: 15) & 屏蔽开屏广告】：精准拦截 ZDBUAdSetUp、ZDOpenScreenAdvController、ABUSplashAd、CSJSplashAd、GMSplashAd，不初始化穿山甲广告，秒进主页
+//  3. 【动态 Ivar 偏移强制群主】：使用 ivar_getOffset 真实物理偏移解锁群主权限、关闭群保护、开启群成员列表，群设置右上角一键拉起【全体成员】
+//  4. 【群发助手内置排行榜接口 + 真实头像 + 纯海鸥号】：一键抓取日榜/周榜/总榜，展示对方圆形头像，剔除等级数字，点击直接填入纯海鸥号精准搜索加人
 //
 
 #import <UIKit/UIKit.h>
@@ -15,151 +14,99 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 
-#pragma mark - ==================== 1. 安全 Hook 工具与官方 BundleID 伪装 ====================
+#pragma mark - ==================== 1. 安全单次 Hook 工具 ====================
 
-static NSString *const kOfficialBundleID = @"com.zhengdu.haiou";
 static NSString *g_myLoginUserId = @"1483263478134476800";
 
-// 安全的 Method Swizzling（正确处理子类未实现方法的情况，返回原始 IMP）
-static IMP SafeSwizzleInstanceMethod(Class cls, SEL origSel, IMP newImp) {
-    if (!cls || !origSel || !newImp) return NULL;
-    Method origMethod = class_getInstanceMethod(cls, origSel);
-    if (!origMethod) return NULL;
-    IMP origImp = method_getImplementation(origMethod);
-    const char *types = method_getTypeEncoding(origMethod);
-    if (class_addMethod(cls, origSel, newImp, types)) {
-        return origImp;
+// 安全替换实例方法（仅在 origImpOut 为空时替换，100% 杜绝二次调用导致自己调自己的死循环递归！）
+static void SafeHookInstanceMethodOnce(Class cls, SEL sel, IMP newImp, IMP *origImpOut) {
+    if (!cls || !sel || !newImp || !origImpOut) return;
+    if (*origImpOut != NULL) return; // 已经 Hook 过，绝不重复 Hook！
+    
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    IMP orig = method_getImplementation(m);
+    if (orig == newImp) return;
+    
+    const char *types = method_getTypeEncoding(m);
+    if (class_addMethod(cls, sel, newImp, types)) {
+        *origImpOut = orig;
     } else {
-        return method_setImplementation(origMethod, newImp);
+        *origImpOut = method_setImplementation(m, newImp);
     }
 }
 
-// 仅安全拦截 -[NSBundle bundleIdentifier]，绝不破坏 infoDictionary 的 Swift 桥接结构！
-static NSString *(*orig_bundleIdentifier)(NSBundle *, SEL) = NULL;
-static NSString *hook_bundleIdentifier(NSBundle *self, SEL _cmd) {
-    if (self == [NSBundle mainBundle]) {
-        return kOfficialBundleID;
+// 将指定方法直接设为空操作（用于彻底废除广告加载方法，无需保存原函数，零递归风险）
+static void DisableMethodWithNoop(Class cls, SEL sel, IMP noopImp) {
+    if (!cls || !sel || !noopImp) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m) {
+        const char *types = method_getTypeEncoding(m);
+        if (!class_addMethod(cls, sel, noopImp, types)) {
+            method_setImplementation(m, noopImp);
+        }
     }
-    NSString *orig = orig_bundleIdentifier ? orig_bundleIdentifier(self, _cmd) : nil;
-    if (orig && [orig hasPrefix:@"com.zhengdu.haiou"]) {
-        return kOfficialBundleID;
+    Method cm = class_getClassMethod(cls, sel);
+    if (cm) {
+        Class metaCls = object_getClass((id)cls);
+        const char *types = method_getTypeEncoding(cm);
+        if (!class_addMethod(metaCls, sel, noopImp, types)) {
+            method_setImplementation(cm, noopImp);
+        }
     }
-    return orig;
 }
 
-#pragma mark - ==================== 2. 彻底屏蔽开屏广告 & 穿山甲/Gromore 广告 SDK ====================
+#pragma mark - ==================== 2. 彻底屏蔽开屏广告 (零崩溃无感拦截) ====================
 
-// 拦截穿山甲/Gromore 开屏广告加载 (loadAdData / showSplashAd) 直接什么都不做
-static void hook_ad_noop(id self, SEL _cmd) {
-    // 彻底屏蔽广告加载与展示
-}
+static void ad_noop_0(id self, SEL _cmd) {}
+static void ad_noop_1(id self, SEL _cmd, id a1) {}
+static void ad_noop_2(id self, SEL _cmd, id a1, id a2) {}
 
-static void hook_ad_noop_arg1(id self, SEL _cmd, id arg1) {
-    // 彻底屏蔽带1个参数的广告展示方法 (如 showAdFromRootViewController:)
-}
-
-static void hook_ad_noop_arg2(id self, SEL _cmd, id arg1, id arg2) {
-    // 彻底屏蔽带2个参数的广告展示方法
-}
-
-// 拦截海鸥自身的开屏广告控制器 ZDOpenScreenAdvController
-static void (*orig_openAdv_viewDidLoad)(id, SEL) = NULL;
-static void hook_openAdv_viewDidLoad(UIViewController *self, SEL _cmd) {
-    // 不调用原生的开屏广告加载逻辑，直接隐藏视图并跳过广告！
+// 拦截海鸥开屏广告控制器 ZDOpenScreenAdvController，一旦出现立即跳过
+static IMP orig_openAdv_viewDidAppear = NULL;
+static void hook_openAdv_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
+    if (orig_openAdv_viewDidAppear) {
+        ((void (*)(id, SEL, BOOL))orig_openAdv_viewDidAppear)(self, _cmd, animated);
+    }
     self.view.hidden = YES;
-    self.view.alpha = 0.0;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.presentingViewController) {
-            [self dismissViewControllerAnimated:NO completion:nil];
-        } else if (self.navigationController && self.navigationController.viewControllers.count > 1) {
-            [self.navigationController popViewControllerAnimated:NO];
-        } else {
-            // 触发它的跳过/关闭方法
-            unsigned int mCount = 0;
-            Method *methods = class_copyMethodList([self class], &mCount);
-            if (methods) {
-                for (unsigned int i = 0; i < mCount; i++) {
-                    NSString *selStr = NSStringFromSelector(method_getName(methods[i]));
-                    if ([selStr.lowercaseString containsString:@"skip"] ||
-                        [selStr.lowercaseString containsString:@"close"] ||
-                        [selStr.lowercaseString containsString:@"jump"] ||
-                        [selStr.lowercaseString containsString:@"dismiss"] ||
-                        [selStr.lowercaseString containsString:@"finish"]) {
-                        if (![selStr containsString:@":"]) {
-                            @try {
-                                ((void (*)(id, SEL))objc_msgSend)(self, method_getName(methods[i]));
-                                break;
-                            } @catch (NSException *e) {}
-                        }
-                    }
-                }
-                free(methods);
-            }
+    self.view.alpha = 0;
+    if (self.presentingViewController) {
+        [self dismissViewControllerAnimated:NO completion:nil];
+    }
+}
+
+static void SetupAdBlockerOnce(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // 1. 废除穿山甲 / Gromore 开屏广告加载与展示方法 (见逆向报告 2.5.1 & 2.5.3 节)
+        NSArray *adClasses = @[
+            @"ZDBUAdSetUp",
+            @"ABUSplashAd", @"CSJSplashAd", @"CSJSplashAdLoader",
+            @"BUSplashAd", @"GMSplashAd"
+        ];
+        NSArray *noop0Sels = @[@"loadAdData", @"loadSplashAd", @"loadAd", @"setUp"];
+        NSArray *noop1Sels = @[
+            @"showAdFromRootViewController:",
+            @"showSplashViewInRootViewController:",
+            @"showInWindow:",
+            @"showSplashAdWithWindow:"
+        ];
+        NSArray *noop2Sels = @[@"showAdFromRootViewController:bottomView:"];
+        
+        for (NSString *clsName in adClasses) {
+            Class c = objc_getClass([clsName UTF8String]);
+            if (!c) continue;
+            for (NSString *s in noop0Sels) DisableMethodWithNoop(c, NSSelectorFromString(s), (IMP)ad_noop_0);
+            for (NSString *s in noop1Sels) DisableMethodWithNoop(c, NSSelectorFromString(s), (IMP)ad_noop_1);
+            for (NSString *s in noop2Sels) DisableMethodWithNoop(c, NSSelectorFromString(s), (IMP)ad_noop_2);
+        }
+        
+        // 2. 拦截海鸥自身的开屏广告控制器 ZDOpenScreenAdvController
+        Class openAdvCls = objc_getClass("_TtC7ZhengDu25ZDOpenScreenAdvController");
+        if (openAdvCls) {
+            SafeHookInstanceMethodOnce(openAdvCls, @selector(viewDidAppear:), (IMP)hook_openAdv_viewDidAppear, &orig_openAdv_viewDidAppear);
         }
     });
-}
-
-// 拦截 UIView 添加子视图：如果发现是穿山甲开屏广告视图 (CSJSplashView / ABUSplashView / BUSplashView) 直接丢弃！
-static void (*orig_view_addSubview)(UIView *, SEL, UIView *) = NULL;
-static void hook_view_addSubview(UIView *self, SEL _cmd, UIView *subview) {
-    if (subview) {
-        NSString *clsName = NSStringFromClass([subview class]);
-        if ([clsName containsString:@"SplashView"] ||
-            [clsName containsString:@"CSJSplash"] ||
-            [clsName containsString:@"ABUSplash"] ||
-            [clsName containsString:@"BUSplash"] ||
-            [clsName containsString:@"GMSplash"]) {
-            subview.hidden = YES;
-            return; // 直接拦截，不挂载任何开屏广告图层！
-        }
-    }
-    if (orig_view_addSubview) {
-        orig_view_addSubview(self, _cmd, subview);
-    }
-}
-
-static void InstallAdBlockerHooks(void) {
-    // 1. 屏蔽海鸥开屏广告控制器 ZDOpenScreenAdvController
-    Class openAdvCls = objc_getClass("_TtC7ZhengDu25ZDOpenScreenAdvController");
-    if (openAdvCls) {
-        orig_openAdv_viewDidLoad = (__typeof__(orig_openAdv_viewDidLoad))SafeSwizzleInstanceMethod(openAdvCls, @selector(viewDidLoad), (IMP)hook_openAdv_viewDidLoad);
-    }
-    
-    // 2. 屏蔽穿山甲 & Gromore 聚合开屏广告类 (见逆向报告 2.5.3 节)
-    NSArray *splashClasses = @[
-        @"ABUSplashAd", @"CSJSplashAd", @"CSJSplashAdLoader",
-        @"BUSplashAd", @"GMSplashAd", @"ABUAdSDKManager",
-        @"BUAdSDKManager", @"CSJAdSDKManager", @"GMAdSDKManager"
-    ];
-    NSArray *adSelectors = @[
-        @"loadAdData", @"loadSplashAd", @"loadAd",
-        @"showAdFromRootViewController:", @"showSplashViewInRootViewController:",
-        @"showInWindow:", @"showSplashAdWithWindow:",
-        @"startWithAsyncCompletionHandler:"
-    ];
-    for (NSString *clsStr in splashClasses) {
-        Class c = objc_getClass([clsStr UTF8String]);
-        if (!c) continue;
-        for (NSString *selStr in adSelectors) {
-            SEL s = NSSelectorFromString(selStr);
-            if (class_getInstanceMethod(c, s)) {
-                NSUInteger colons = [[selStr componentsSeparatedByString:@":"] count] - 1;
-                if (colons == 0) SafeSwizzleInstanceMethod(c, s, (IMP)hook_ad_noop);
-                else if (colons == 1) SafeSwizzleInstanceMethod(c, s, (IMP)hook_ad_noop_arg1);
-                else if (colons == 2) SafeSwizzleInstanceMethod(c, s, (IMP)hook_ad_noop_arg2);
-            }
-            if (class_getClassMethod(c, s)) {
-                Class metaCls = object_getClass((id)c);
-                NSUInteger colons = [[selStr componentsSeparatedByString:@":"] count] - 1;
-                if (colons == 0) SafeSwizzleInstanceMethod(metaCls, s, (IMP)hook_ad_noop);
-                else if (colons == 1) SafeSwizzleInstanceMethod(metaCls, s, (IMP)hook_ad_noop_arg1);
-                else if (colons == 2) SafeSwizzleInstanceMethod(metaCls, s, (IMP)hook_ad_noop_arg2);
-            }
-        }
-    }
-    
-    // 3. 拦截开屏广告图层挂载
-    orig_view_addSubview = (__typeof__(orig_view_addSubview))SafeSwizzleInstanceMethod([UIView class], @selector(addSubview:), (IMP)hook_view_addSubview);
 }
 
 #pragma mark - ==================== 3. 动态 Ivar 偏移与 Swift 内存安全工具 ====================
@@ -181,7 +128,7 @@ static id SafeCallObj(id obj, NSString *selName) {
     return nil;
 }
 
-// 只提取纯 ASCII 数字和字母，彻底剥离“海鸥号：”中文前缀
+// 剥离“海鸥号：”中文前缀，只留纯 ASCII 数字和字母，搜索添加 100% 匹配
 static NSString *ExtractPureASCIIAccount(NSString *raw) {
     if (!raw || raw.length == 0) return nil;
     NSMutableString *res = [NSMutableString string];
@@ -194,7 +141,7 @@ static NSString *ExtractPureASCIIAccount(NSString *raw) {
     return res.length >= 4 ? res : nil;
 }
 
-// 严格剔除等级、经验、排名等干扰文字
+// 严格过滤等级、排名、经验等非昵称文字
 static BOOL IsLevelOrNoiseText(NSString *text) {
     if (!text || text.length == 0) return YES;
     NSString *s = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -222,6 +169,7 @@ static BOOL IsLevelOrNoiseText(NSString *text) {
     return NO;
 }
 
+// 提取对方真实头像 UIImage
 static UIImage *ExtractAvatarImage(UIView *view) {
     if (!view || view.hidden) return nil;
     if ([view isKindOfClass:[UIImageView class]]) {
@@ -246,7 +194,7 @@ static NSString *ReadSwiftStringByIvar(id obj, const char *ivarName) {
     ptrdiff_t offset = GetRealIvarOffset([obj class], ivarName);
     if (offset <= 0) return nil;
     @try {
-        uint8_t *base = (uint8_t *)(__bridge void *)obj;
+        uint8_t *base = (__bridge void *)obj;
         uint64_t w0 = *(uint64_t *)(base + offset);
         uint64_t w1 = *(uint64_t *)(base + offset + 8);
         if (w0 == 0 && w1 == 0) return nil;
@@ -268,7 +216,6 @@ static NSString *ReadSwiftStringByIvar(id obj, const char *ivarName) {
             if (!sym) sym = dlsym(RTLD_DEFAULT, "_$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF");
             bridgeFn = (SwiftBridgeToNSStringFn)sym;
         });
-        // 校验高字节包含合法的 Swift String 对象桥接标记，防止非法指针解引用
         if (bridgeFn && w1 > 0x100000000ULL) {
             id s = bridgeFn(w0, w1);
             if ([s isKindOfClass:[NSString class]]) return (NSString *)s;
@@ -290,7 +237,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
     });
     if (!toSwiftFn) return;
     @try {
-        uint8_t *base = (uint8_t *)(__bridge void *)obj;
+        uint8_t *base = (__bridge void *)obj;
         SwiftStringWords words = toSwiftFn(newVal);
         *(uint64_t *)(base + offset) = words.w0;
         *(uint64_t *)(base + offset + 8) = words.w1;
@@ -384,7 +331,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
         _joinedGroupsMap = [NSMutableDictionary dictionary];
         _contactFriendsMap = [NSMutableDictionary dictionary];
         _hiddenRankItemVCs = [NSMutableArray array];
-        _seqCounter = 5000;
+        _seqCounter = 6000;
         [self loadFromDisk];
         [self detectCurrentLoginUserId];
     }
@@ -409,10 +356,10 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
 - (void)saveToDisk {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     @try {
-        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_rankUsersMap requiringSecureCoding:NO error:nil] forKey:@"HO_V5_RankUsers"];
-        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_groupMembersMap requiringSecureCoding:NO error:nil] forKey:@"HO_V5_GroupMembers"];
-        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_joinedGroupsMap requiringSecureCoding:NO error:nil] forKey:@"HO_V5_Groups"];
-        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_contactFriendsMap requiringSecureCoding:NO error:nil] forKey:@"HO_V5_Friends"];
+        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_rankUsersMap requiringSecureCoding:NO error:nil] forKey:@"HO_V6_RankUsers"];
+        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_groupMembersMap requiringSecureCoding:NO error:nil] forKey:@"HO_V6_GroupMembers"];
+        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_joinedGroupsMap requiringSecureCoding:NO error:nil] forKey:@"HO_V6_Groups"];
+        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_contactFriendsMap requiringSecureCoding:NO error:nil] forKey:@"HO_V6_Friends"];
     } @catch (NSException *e) {}
     [ud synchronize];
 }
@@ -420,10 +367,10 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
 - (void)loadFromDisk {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     @try {
-        NSData *r = [ud objectForKey:@"HO_V5_RankUsers"];
-        NSData *gm = [ud objectForKey:@"HO_V5_GroupMembers"];
-        NSData *g = [ud objectForKey:@"HO_V5_Groups"];
-        NSData *f = [ud objectForKey:@"HO_V5_Friends"];
+        NSData *r = [ud objectForKey:@"HO_V6_RankUsers"];
+        NSData *gm = [ud objectForKey:@"HO_V6_GroupMembers"];
+        NSData *g = [ud objectForKey:@"HO_V6_Groups"];
+        NSData *f = [ud objectForKey:@"HO_V6_Friends"];
         if (r) [_rankUsersMap addEntriesFromDictionary:[NSKeyedUnarchiver unarchiveObjectWithData:r]];
         if (gm) [_groupMembersMap addEntriesFromDictionary:[NSKeyedUnarchiver unarchiveObjectWithData:gm]];
         if (g) [_joinedGroupsMap addEntriesFromDictionary:[NSKeyedUnarchiver unarchiveObjectWithData:g]];
@@ -439,7 +386,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
     if (![NSStringFromClass(cls) containsString:@"ZDGroup"] || [NSStringFromClass(cls) containsString:@"Member"]) return;
     
     @try {
-        uint8_t *base = (uint8_t *)(__bridge void *)groupObj;
+        uint8_t *base = (__bridge void *)groupObj;
         if (g_myLoginUserId.length > 0) {
             WriteSwiftStringByIvar(groupObj, "userId", g_myLoginUserId);
         }
@@ -472,7 +419,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
     Class cls = [memberObj class];
     if (![NSStringFromClass(cls) containsString:@"ZDGroupMember"]) return;
     @try {
-        uint8_t *base = (uint8_t *)(__bridge void *)memberObj;
+        uint8_t *base = (__bridge void *)memberObj;
         ptrdiff_t roleOff = GetRealIvarOffset(cls, "role");
         if (roleOff > 0) base[roleOff] = 1;
         
@@ -487,7 +434,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
         unsigned int count = 0;
         Ivar *ivars = class_copyIvarList([vc class], &count);
         if (!ivars) return;
-        uint8_t *base = (uint8_t *)(__bridge void *)vc;
+        uint8_t *base = (__bridge void *)vc;
         for (unsigned int i = 0; i < count; i++) {
             const char *name = ivar_getName(ivars[i]);
             ptrdiff_t off = ivar_getOffset(ivars[i]);
@@ -506,15 +453,15 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
                         [self unlockMemberOwnerPrivilege:subObj];
                     } else if ([subCls containsString:@"ZDConversationViewModel1"]) {
                         Class vmCls = [subObj class];
-                        uint8_t *vmBase = (uint8_t *)(__bridge void *)subObj;
+                        uint8_t *vmBase = (__bridge void *)subObj;
                         ptrdiff_t grpOff = GetRealIvarOffset(vmCls, "zd_group");
                         if (grpOff > 0) {
-                            id grp = (__bridge id )*(void **)(vmBase + grpOff);
+                            id grp = *(id __unsafe_unretained *)(vmBase + grpOff);
                             if (grp) [self unlockGroupOwnerPrivilege:grp];
                         }
                         ptrdiff_t meOff = GetRealIvarOffset(vmCls, "zd_meInGroup");
                         if (meOff > 0) {
-                            id me = (__bridge id )*(void **)(vmBase + meOff);
+                            id me = *(id __unsafe_unretained *)(vmBase + meOff);
                             if (me) [self unlockMemberOwnerPrivilege:me];
                         }
                     }
@@ -766,7 +713,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
     for (UIViewController *vc in _hiddenRankItemVCs) {
         UICollectionView *cv = nil;
         if (collectOff > 0) {
-            cv = (__bridge UICollectionView *)*(void **)((uint8_t *)(__bridge void *)vc + collectOff);
+            cv = *(UICollectionView * __unsafe_unretained *)((uint8_t *)(__bridge void *)vc + collectOff);
         }
         if (![cv isKindOfClass:[UICollectionView class]]) {
             for (UIView *sub in vc.view.subviews) {
@@ -855,7 +802,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = [NSString stringWithFormat:@"群发助手 (%@)", [[NSBundle mainBundle] bundleIdentifier]];
+    self.title = @"群发助手 (com.zhengdu.haiou)";
     self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
     
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"返回" style:UIBarButtonItemStylePlain target:self action:@selector(closeSelf)];
@@ -1034,7 +981,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    static NSString *cid = @"HOAvatarCellV5";
+    static NSString *cid = @"HOAvatarCellV6";
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cid];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cid];
@@ -1086,7 +1033,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
 
 @end
 
-#pragma mark - ==================== 6. 业务页面 Hook 挂载区 ====================
+#pragma mark - ==================== 6. 业务页面 Hook 实现 (严格单次交换) ====================
 
 static void ho_openMassHelperFromMine(UIViewController *mineVC) {
     if (!mineVC) return;
@@ -1104,9 +1051,9 @@ static void ho_mine_onTapEmbeddedMassBtn(id self, SEL _cmd, UIButton *sender) {
     ho_openMassHelperFromMine((UIViewController *)self);
 }
 
-static UITableViewCell *(*orig_mine_cellForRow)(id, SEL, UITableView *, NSIndexPath *) = NULL;
+static IMP orig_mine_cellForRow = NULL;
 static UITableViewCell *hook_mine_cellForRow(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
-    UITableViewCell *cell = orig_mine_cellForRow(self, _cmd, tableView, indexPath);
+    UITableViewCell *cell = ((UITableViewCell *(*)(id, SEL, UITableView *, NSIndexPath *))orig_mine_cellForRow)(self, _cmd, tableView, indexPath);
     if (cell) {
         BOOL isHaiouHelperRow = NO;
         for (UIView *sub in cell.contentView.subviews) {
@@ -1153,18 +1100,22 @@ static UITableViewCell *hook_mine_cellForRow(id self, SEL _cmd, UITableView *tab
     return cell;
 }
 
-static void (*orig_chat_viewWillAppear)(id, SEL, BOOL) = NULL;
+static IMP orig_chat_viewWillAppear = NULL;
 static void hook_chat_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     [[HOMassEngine shared] applyGroupOwnerOnVC:(UIViewController *)self];
-    if (orig_chat_viewWillAppear) orig_chat_viewWillAppear(self, _cmd, animated);
+    if (orig_chat_viewWillAppear) {
+        ((void (*)(id, SEL, BOOL))orig_chat_viewWillAppear)(self, _cmd, animated);
+    }
     [[HOMassEngine shared] applyGroupOwnerOnVC:(UIViewController *)self];
 }
 
-static void (*orig_groupSet_viewWillAppear)(id, SEL, BOOL) = NULL;
+static IMP orig_groupSet_viewWillAppear = NULL;
 static void hook_groupSet_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     UIViewController *vc = (UIViewController *)self;
     [[HOMassEngine shared] applyGroupOwnerOnVC:vc];
-    if (orig_groupSet_viewWillAppear) orig_groupSet_viewWillAppear(self, _cmd, animated);
+    if (orig_groupSet_viewWillAppear) {
+        ((void (*)(id, SEL, BOOL))orig_groupSet_viewWillAppear)(self, _cmd, animated);
+    }
     [[HOMassEngine shared] applyGroupOwnerOnVC:vc];
     vc.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"👥全体成员" style:UIBarButtonItemStyleDone target:vc action:NSSelectorFromString(@"ho_forceOpenMemberListVC")];
 }
@@ -1178,8 +1129,8 @@ static void ho_forceOpenMemberListVC_imp(id self, SEL _cmd) {
             unsigned int c1 = 0, c2 = 0;
             Ivar *ivars1 = class_copyIvarList([vc class], &c1);
             Ivar *ivars2 = class_copyIvarList(memberListCls, &c2);
-            uint8_t *base1 = (uint8_t *)(__bridge void *)vc;
-            uint8_t *base2 = (uint8_t *)(__bridge void *)listVC;
+            uint8_t *base1 = (__bridge void *)vc;
+            uint8_t *base2 = (__bridge void *)listVC;
             if (ivars1 && ivars2) {
                 for (unsigned int i = 0; i < c1; i++) {
                     ptrdiff_t off1 = ivar_getOffset(ivars1[i]);
@@ -1195,7 +1146,7 @@ static void ho_forceOpenMemberListVC_imp(id self, SEL _cmd) {
                                     NSString *s2 = [NSString stringWithUTF8String:n2];
                                     if (([cn containsString:@"ZDGroup"] && [s2.lowercaseString containsString:@"group"]) ||
                                         ([cn containsString:@"ZDSession"] && [s2.lowercaseString containsString:@"session"])) {
-                                        *(void **)(base2 + off2) = (__bridge void *)obj;
+                                        *(id __strong *)(base2 + off2) = obj;
                                     }
                                 }
                             }
@@ -1210,11 +1161,9 @@ static void ho_forceOpenMemberListVC_imp(id self, SEL _cmd) {
     }
 }
 
-static void hook_rank_clickUpgrade(id self, SEL _cmd) {}
-
-static UICollectionViewCell *(*orig_rank_cellForItem)(id, SEL, UICollectionView *, NSIndexPath *) = NULL;
+static IMP orig_rank_cellForItem = NULL;
 static UICollectionViewCell *hook_rank_cellForItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
-    UICollectionViewCell *cell = orig_rank_cellForItem(self, _cmd, cv, indexPath);
+    UICollectionViewCell *cell = ((UICollectionViewCell *(*)(id, SEL, UICollectionView *, NSIndexPath *))orig_rank_cellForItem)(self, _cmd, cv, indexPath);
     if (cell) {
         UIViewController *vc = (UIViewController *)self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1224,9 +1173,9 @@ static UICollectionViewCell *hook_rank_cellForItem(id self, SEL _cmd, UICollecti
     return cell;
 }
 
-static UITableViewCell *(*orig_tv_dequeue)(UITableView *, SEL, NSString *, NSIndexPath *) = NULL;
+static IMP orig_tv_dequeue = NULL;
 static UITableViewCell *hook_tv_dequeue(UITableView *self, SEL _cmd, NSString *identifier, NSIndexPath *indexPath) {
-    UITableViewCell *cell = orig_tv_dequeue(self, _cmd, identifier, indexPath);
+    UITableViewCell *cell = ((UITableViewCell *(*)(UITableView *, SEL, NSString *, NSIndexPath *))orig_tv_dequeue)(self, _cmd, identifier, indexPath);
     if (cell && [NSStringFromClass([cell class]) containsString:@"ZDContactCell"]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[HOMassEngine shared] harvestContactCell:cell];
@@ -1235,9 +1184,9 @@ static UITableViewCell *hook_tv_dequeue(UITableView *self, SEL _cmd, NSString *i
     return cell;
 }
 
-static id (*orig_group_init)(id, SEL) = NULL;
+static IMP orig_group_init = NULL;
 static id hook_group_init(id self, SEL _cmd) {
-    id ins = orig_group_init(self, _cmd);
+    id ins = ((id (*)(id, SEL))orig_group_init)(self, _cmd);
     if (ins) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[HOMassEngine shared] harvestGroupObject:ins];
@@ -1246,9 +1195,9 @@ static id hook_group_init(id self, SEL _cmd) {
     return ins;
 }
 
-static id (*orig_member_init)(id, SEL) = NULL;
+static IMP orig_member_init = NULL;
 static id hook_member_init(id self, SEL _cmd) {
-    id ins = orig_member_init(self, _cmd);
+    id ins = ((id (*)(id, SEL))orig_member_init)(self, _cmd);
     if (ins) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[HOMassEngine shared] harvestGroupMemberObject:ins];
@@ -1257,57 +1206,68 @@ static id hook_member_init(id self, SEL _cmd) {
     return ins;
 }
 
-#pragma mark - ==================== 7. Dylib 构造函数入口 ====================
+// 拦截“关于我们”页面，将显示的包名/标识强制显示为官方 com.zhengdu.haiou
+static IMP orig_about_viewDidAppear = NULL;
+static void hook_about_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
+    if (orig_about_viewDidAppear) {
+        ((void (*)(id, SEL, BOOL))orig_about_viewDidAppear)(self, _cmd, animated);
+    }
+    self.title = @"关于海鸥 (com.zhengdu.haiou)";
+}
+
+#pragma mark - ==================== 7. Dylib 构造函数入口 (严格单次挂载) ====================
 
 __attribute__((constructor))
-static void HaiouMassHelperV5Init(void) {
-    // 1. 安全伪装官方 BundleID ("com.zhengdu.haiou")，不破坏 infoDictionary 桥接
-    orig_bundleIdentifier = (__typeof__(orig_bundleIdentifier))SafeSwizzleInstanceMethod([NSBundle class], @selector(bundleIdentifier), (IMP)hook_bundleIdentifier);
-    
-    // 2. 立即挂载开屏广告拦截器
-    InstallAdBlockerHooks();
-    
+static void HaiouMassHelperV6Init(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 再次确保所有动态加载的广告 SDK 类被屏蔽
-        InstallAdBlockerHooks();
-        
-        // 3. 挂载「我的」页面 ZDMineController
-        Class mineCls = objc_getClass("_TtC7ZhengDu16ZDMineController");
-        if (mineCls) {
-            class_addMethod(mineCls, NSSelectorFromString(@"ho_mine_onTapEmbeddedMassBtn:"), (IMP)ho_mine_onTapEmbeddedMassBtn, "v@:@");
-            orig_mine_cellForRow = (__typeof__(orig_mine_cellForRow))SafeSwizzleInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:), (IMP)hook_mine_cellForRow);
-        }
-        
-        // 4. 挂载聊天页与群设置页
-        Class chatCls = objc_getClass("_TtC7ZhengDu25ZDConversationController1");
-        if (chatCls) {
-            orig_chat_viewWillAppear = (__typeof__(orig_chat_viewWillAppear))SafeSwizzleInstanceMethod(chatCls, @selector(viewWillAppear:), (IMP)hook_chat_viewWillAppear);
-        }
-        
-        Class groupSetCls = objc_getClass("_TtC7ZhengDu30ZDConversationGroupSetController");
-        if (groupSetCls) {
-            class_addMethod(groupSetCls, NSSelectorFromString(@"ho_forceOpenMemberListVC"), (IMP)ho_forceOpenMemberListVC_imp, "v@:");
-            orig_groupSet_viewWillAppear = (__typeof__(orig_groupSet_viewWillAppear))SafeSwizzleInstanceMethod(groupSetCls, @selector(viewWillAppear:), (IMP)hook_groupSet_viewWillAppear);
-        }
-        
-        // 5. 挂载排行榜 ZDGlobalTopItemController
-        Class rankItemCls = objc_getClass("_TtC7ZhengDu25ZDGlobalTopItemController");
-        if (rankItemCls) {
-            SafeSwizzleInstanceMethod(rankItemCls, NSSelectorFromString(@"zd_clickUpgrade"), (IMP)hook_rank_clickUpgrade);
-            orig_rank_cellForItem = (__typeof__(orig_rank_cellForItem))SafeSwizzleInstanceMethod(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:), (IMP)hook_rank_cellForItem);
-        }
-        
-        // 6. 挂载通讯录 Cell、ZDGroup、ZDGroupMember
-        orig_tv_dequeue = (__typeof__(orig_tv_dequeue))SafeSwizzleInstanceMethod([UITableView class], @selector(dequeueReusableCellWithIdentifier:forIndexPath:), (IMP)hook_tv_dequeue);
-        
-        Class grpCls = objc_getClass("_TtC7ZhengDu7ZDGroup");
-        if (grpCls) {
-            orig_group_init = (__typeof__(orig_group_init))SafeSwizzleInstanceMethod(grpCls, @selector(init), (IMP)hook_group_init);
-        }
-        
-        Class memCls = objc_getClass("_TtC7ZhengDu13ZDGroupMember");
-        if (memCls) {
-            orig_member_init = (__typeof__(orig_member_init))SafeSwizzleInstanceMethod(memCls, @selector(init), (IMP)hook_member_init);
-        }
+        static dispatch_once_t mainOnceToken;
+        dispatch_once(&mainOnceToken, ^{
+            // 1. 屏蔽开屏广告
+            SetupAdBlockerOnce();
+            
+            // 2. 挂载「我的」页面 ZDMineController
+            Class mineCls = objc_getClass("_TtC7ZhengDu16ZDMineController");
+            if (mineCls) {
+                class_addMethod(mineCls, NSSelectorFromString(@"ho_mine_onTapEmbeddedMassBtn:"), (IMP)ho_mine_onTapEmbeddedMassBtn, "v@:@");
+                SafeHookInstanceMethodOnce(mineCls, @selector(tableView:cellForRowAtIndexPath:), (IMP)hook_mine_cellForRow, &orig_mine_cellForRow);
+            }
+            
+            // 3. 挂载聊天页与群设置页 (强制模拟群主 + 提取群成员)
+            Class chatCls = objc_getClass("_TtC7ZhengDu25ZDConversationController1");
+            if (chatCls) {
+                SafeHookInstanceMethodOnce(chatCls, @selector(viewWillAppear:), (IMP)hook_chat_viewWillAppear, &orig_chat_viewWillAppear);
+            }
+            
+            Class groupSetCls = objc_getClass("_TtC7ZhengDu30ZDConversationGroupSetController");
+            if (groupSetCls) {
+                class_addMethod(groupSetCls, NSSelectorFromString(@"ho_forceOpenMemberListVC"), (IMP)ho_forceOpenMemberListVC_imp, "v@:");
+                SafeHookInstanceMethodOnce(groupSetCls, @selector(viewWillAppear:), (IMP)hook_groupSet_viewWillAppear, &orig_groupSet_viewWillAppear);
+            }
+            
+            // 4. 挂载排行榜 ZDGlobalTopItemController
+            Class rankItemCls = objc_getClass("_TtC7ZhengDu25ZDGlobalTopItemController");
+            if (rankItemCls) {
+                DisableMethodWithNoop(rankItemCls, NSSelectorFromString(@"zd_clickUpgrade"), (IMP)ad_noop_0);
+                SafeHookInstanceMethodOnce(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:), (IMP)hook_rank_cellForItem, &orig_rank_cellForItem);
+            }
+            
+            // 5. 挂载通讯录 Cell、ZDGroup、ZDGroupMember
+            SafeHookInstanceMethodOnce([UITableView class], @selector(dequeueReusableCellWithIdentifier:forIndexPath:), (IMP)hook_tv_dequeue, &orig_tv_dequeue);
+            
+            Class grpCls = objc_getClass("_TtC7ZhengDu7ZDGroup");
+            if (grpCls) {
+                SafeHookInstanceMethodOnce(grpCls, @selector(init), (IMP)hook_group_init, &orig_group_init);
+            }
+            
+            Class memCls = objc_getClass("_TtC7ZhengDu13ZDGroupMember");
+            if (memCls) {
+                SafeHookInstanceMethodOnce(memCls, @selector(init), (IMP)hook_member_init, &orig_member_init);
+            }
+            
+            Class aboutCls = objc_getClass("_TtC7ZhengDu19ZDAboutUsController");
+            if (aboutCls) {
+                SafeHookInstanceMethodOnce(aboutCls, @selector(viewDidAppear:), (IMP)hook_about_viewDidAppear, &orig_about_viewDidAppear);
+            }
+        });
     });
 }
