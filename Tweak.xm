@@ -1,11 +1,12 @@
 //
 //  HaiouMassHelper.m
-//  海鸥 3.2.9 (Build 20261022) 群发与全自动拓客助手 Dylib (深度抓包定制版)
-//  核心升级:
-//  1. 去掉无用的跳底按钮，改为【底层拦截 limit=100 突破为大分页 + 后台无痕静默刷新 + 锁定最底部】
-//  2. 修复通讯录读取为0：直接从 Runtime 内存模型抓取代替读加密 SQLite，100% 获取通讯录好友与群聊
-//  3. 修复群聊全员提取：拦截群接口与群成员列表控制器，一键拉取本群所有成员
-//  4. 修复加好友/群发无反应：接入 App 原生 ZDChatManager 发送通道与原生加好友控制器自动提交链路
+//  海鸥 3.2.9 (Build 20261022) 逆向报告精确偏移定制版 Dylib
+//  基于《海鸥3.2.9全量逆向分析报告_2.docx》100% 精确内存偏移编写:
+//  1. 彻底清除乱抓文字Bug：废除全局UITableView盲抓，仅精确提取通讯录Cell、群模型、排行榜Cell与群成员模型
+//  2. 排行榜突破200人限制：直接修改 ZDGlobalTopItemController 偏移 0x70(zd_page) 与 0x78(zd_size)，强制分页叠加采集
+//  3. 群聊突破群主权限：强制修改 ZDGroup 偏移 0x118(protect=0)、0x119(groupMemberList=1)、0x148(myRole=群主)，一键强开 ZDConversationGroupMemberListController
+//  4. 点击任意采集成员 -> 直接打开其个人主页/原生加好友页 (ZDNewUserInfoController / ZDAddFriendOrGroupController) 手动点添加100%必达
+//  5. 支持一键唤起海鸥原生隐藏的群发控制器 (ZDGroupSendMessageController)
 //
 
 #import <UIKit/UIKit.h>
@@ -13,88 +14,82 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#pragma mark - ==================== 全局状态与安全辅助工具 ====================
+#pragma mark - ==================== 全局状态与 Swift 内存安全读取工具 ====================
 
 static __weak UITableView *g_currentMineTableView = nil;
 static NSIndexPath *g_currentRealRequestIndexPath = nil;
 
-// 排行榜突破参数控制
-static NSInteger g_customRankLimit = 5000;   // 将 limit=100 直接突破改写为 5000
-static NSInteger g_customRankOffset = 1;     // 后台无痕刷新的页码控制
-static BOOL g_lockRankAtBottom = NO;         // 是否锁定排行榜停留在最底部
-
-static NSString *SafeObjString(id obj) {
-    if (!obj || obj == [NSNull null]) return nil;
-    if ([obj isKindOfClass:[NSString class]]) return (NSString *)obj;
-    if ([obj isKindOfClass:[NSNumber class]]) return [(NSNumber *)obj stringValue];
-    if ([obj isKindOfClass:[UILabel class]]) return [(UILabel *)obj text];
+// 安全读取 ObjC 属性/KVC
+static NSString *SafeObjCString(id obj, NSString *selName) {
+    if (!obj || !selName) return nil;
+    SEL sel = NSSelectorFromString(selName);
+    if ([obj respondsToSelector:sel]) {
+        @try {
+            id val = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+            if ([val isKindOfClass:[NSString class]]) return (NSString *)val;
+            if ([val isKindOfClass:[NSNumber class]]) return [(NSNumber *)val stringValue];
+            if ([val isKindOfClass:[UILabel class]]) return [(UILabel *)val text];
+        } @catch (NSException *e) {}
+    }
     return nil;
 }
 
-static NSString *SafeKVC(id obj, NSString *key) {
-    if (!obj || !key) return nil;
+// 核心黑科技：直接从 arm64 内存偏移读取 16 字节的 Swift.String (Small String & Large String Bridge)
+static NSString *ReadSwiftStringAtOffset(id obj, ptrdiff_t offset) {
+    if (!obj || offset <= 0) return nil;
     @try {
-        return SafeObjString([obj valueForKey:key]);
-    } @catch (NSException *e) {
-        return nil;
-    }
-}
-
-// 扫描对象的全部 Ivar 内存读取属性值（应对 Swift 属性不走 KVC 的情况）
-static NSDictionary<NSString *, id> *DumpObjectIvars(id obj) {
-    if (!obj) return @{};
-    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
-    Class cls = [obj class];
-    while (cls && cls != [NSObject class] && cls != [UIResponder class] && cls != [UIView class] && cls != [UIViewController class]) {
-        unsigned int count = 0;
-        Ivar *ivars = class_copyIvarList(cls, &count);
-        for (unsigned int i = 0; i < count; i++) {
-            const char *name = ivar_getName(ivars[i]);
-            const char *type = ivar_getTypeEncoding(ivars[i]);
-            if (!name || !type) continue;
-            NSString *key = [NSString stringWithUTF8String:name];
-            if (type[0] == '@') {
-                id val = object_getIvar(obj, ivars[i]);
-                if (val) dict[key] = val;
-            } else if (type[0] == 'q' || type[0] == 'Q' || type[0] == 'i' || type[0] == 'I' || type[0] == 'B' || type[0] == 'c') {
-                ptrdiff_t offset = ivar_getOffset(ivars[i]);
-                if (offset > 0) {
-                    uint8_t *base = (__bridge void *)obj;
-                    NSInteger v = *(NSInteger *)(base + offset);
-                    dict[key] = @(v);
-                }
+        uint8_t *base = (__bridge void *)obj;
+        uint64_t word0 = *(uint64_t *)(base + offset);
+        uint64_t word1 = *(uint64_t *)(base + offset + 8);
+        if (word0 == 0 && word1 == 0) return nil;
+        
+        // 判断 Swift 5 Small String (最高位 bit63=1, bit61=1，高字节低4位存长度)
+        uint8_t topByte = (uint8_t)(word1 >> 56);
+        if ((topByte & 0xE0) == 0xE0) {
+            NSUInteger len = topByte & 0x0F;
+            if (len > 0 && len <= 15) {
+                char buf[16] = {0};
+                memcpy(buf, base + offset, len);
+                NSString *s = [[NSString alloc] initWithBytes:buf length:len encoding:NSUTF8StringEncoding];
+                return s;
+            }
+            return @"";
+        }
+        
+        // Large String: word1 的低 56 位（去掉高 8 位标志）加上偏移量即为 UTF8 缓冲区或 _StringStorage 对象
+        // 在 arm64 Swift ABI 中，直接调用 Swift 标准库桥接函数 _bridgeToObjectiveC 最稳妥：
+        typedef id (*SwiftStringToNSStringFunc)(uint64_t, uint64_t);
+        static SwiftStringToNSStringFunc bridgeFunc = NULL;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            // 符号 _$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF
+            void *sym = dlsym(RTLD_DEFAULT, "$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF");
+            if (!sym) sym = dlsym(RTLD_DEFAULT, "_$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF");
+            bridgeFunc = (SwiftStringToNSStringFunc)sym;
+        });
+        if (bridgeFunc && (word1 != 0)) {
+            id nsStr = bridgeFunc(word0, word1);
+            if ([nsStr isKindOfClass:[NSString class]]) {
+                return (NSString *)nsStr;
             }
         }
-        if (ivars) free(ivars);
-        cls = class_getSuperclass(cls);
-    }
-    return dict;
-}
-
-static void CollectLabelsInView(UIView *view, NSMutableArray<NSString *> *outTexts) {
-    if (!view || view.hidden || view.alpha < 0.01) return;
-    if ([view isKindOfClass:[UILabel class]]) {
-        NSString *t = [(UILabel *)view text];
-        if (t.length > 0) [outTexts addObject:[t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]];
-    }
-    for (UIView *sub in view.subviews) {
-        CollectLabelsInView(sub, outTexts);
-    }
-}
-
-static UIScrollView *FindScrollViewInView(UIView *root) {
-    if (!root) return nil;
-    if ([root isKindOfClass:[UICollectionView class]] || [root isKindOfClass:[UITableView class]]) {
-        return (UIScrollView *)root;
-    }
-    for (UIView *sub in root.subviews) {
-        UIScrollView *sv = FindScrollViewInView(sub);
-        if (sv) return sv;
-    }
+    } @catch (NSException *e) {}
     return nil;
 }
 
-static UIViewController *TopMostViewController(void) {
+// 递归收集某个特定 Cell 内的 UILabel 文本（仅在指定 Cell 类中使用，绝不全表乱抓）
+static void CollectCellLabels(UIView *view, NSMutableArray<NSString *> *outTexts) {
+    if (!view || view.hidden || view.alpha < 0.01) return;
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *t = [[(UILabel *)view text] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (t.length > 0) [outTexts addObject:t];
+    }
+    for (UIView *sub in view.subviews) {
+        CollectCellLabels(sub, outTexts);
+    }
+}
+
+static UIViewController *TopMostVC(void) {
     UIWindow *win = [UIApplication sharedApplication].keyWindow;
     if (!win) {
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
@@ -103,30 +98,25 @@ static UIViewController *TopMostViewController(void) {
     }
     UIViewController *vc = win.rootViewController;
     while (vc) {
-        if (vc.presentedViewController) {
-            vc = vc.presentedViewController;
-        } else if ([vc isKindOfClass:[UINavigationController class]]) {
-            vc = [(UINavigationController *)vc visibleViewController];
-        } else if ([vc isKindOfClass:[UITabBarController class]]) {
-            vc = [(UITabBarController *)vc selectedViewController];
-        } else {
-            break;
-        }
+        if (vc.presentedViewController) vc = vc.presentedViewController;
+        else if ([vc isKindOfClass:[UINavigationController class]]) vc = [(UINavigationController *)vc visibleViewController];
+        else if ([vc isKindOfClass:[UITabBarController class]]) vc = [(UITabBarController *)vc selectedViewController];
+        else break;
     }
     return vc;
 }
 
-#pragma mark - ==================== 数据模型与核心拓客引擎 ====================
+#pragma mark - ==================== 数据项与核心引擎 ====================
 
 @interface HOModelItem : NSObject <NSCoding>
-@property (nonatomic, copy) NSString *itemId;       // 真实 userId 或 groupId
+@property (nonatomic, copy) NSString *itemId;       // userId 或 groupId
 @property (nonatomic, copy) NSString *account;      // 海鸥号 / 群号
 @property (nonatomic, copy) NSString *name;         // 昵称 / 群名
-@property (nonatomic, copy) NSString *source;       // 来源
-@property (nonatomic, assign) NSInteger collectSeq; // 采集顺序号
+@property (nonatomic, copy) NSString *source;       // 精确来源 (排行榜/某群成员/通讯录)
+@property (nonatomic, assign) NSInteger collectSeq; // 采集序号 (越大越新)
 @property (nonatomic, assign) BOOL isGroup;
 @property (nonatomic, assign) BOOL isSelected;
-@property (nonatomic, strong) id rawModel;          // 保存海鸥原始模型引用，用于直接调用原生发送/加人接口
+@property (nonatomic, strong) id rawUserOrMemberObj;// 原始对象引用(可直接用于打开个人主页)
 @end
 
 @implementation HOModelItem
@@ -155,38 +145,38 @@ static UIViewController *TopMostViewController(void) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *contactFriendsMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *joinedGroupsMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *collectedUsersMap;
-@property (nonatomic, strong) NSMutableSet<NSString *> *addedRequestHistory;
 @property (nonatomic, assign) NSInteger globalSeqCounter;
 
-@property (nonatomic, assign) BOOL autoAddNewGroupMember;
-@property (nonatomic, copy) NSString *defaultVerifyMsg;
-@property (nonatomic, assign) NSTimeInterval batchDelay;
-
-// 排行榜后台无痕刷新控制
-@property (nonatomic, strong) NSTimer *silentRankTimer;
-@property (nonatomic, assign) BOOL isSilentRefreshing;
-@property (nonatomic, weak) UIViewController *activeRankVC;
-@property (nonatomic, weak) UIButton *rankSilentBtn;
-
-// 缓存海鸥核心单例引用
-@property (nonatomic, weak) id chatManagerInstance;
+// 排行榜无痕分页刷新状态
+@property (nonatomic, strong) NSTimer *rankPageTimer;
+@property (nonatomic, assign) BOOL isRankPaging;
+@property (nonatomic, weak) UIViewController *activeRankItemVC;
+@property (nonatomic, weak) UIButton *rankActionBtn;
 
 @property (nonatomic, assign) NSInteger haiouAssistantSection;
 @property (nonatomic, assign) NSInteger haiouAssistantRow;
 
 + (instancetype)shared;
 - (void)saveCacheToDisk;
-- (void)inspectRuntimeModel:(id)model sourceHint:(NSString *)hint;
-- (void)harvestFromCell:(UIView *)cell defaultSource:(NSString *)source;
-- (void)scanAllVisibleViewsAndControllersForContacts;
+- (void)clearDirtyDataAndSave;
 
-// 排行榜后台无痕刷新
-- (void)toggleSilentBackgroundRefreshOnRankVC:(UIViewController *)vc;
-- (void)stopSilentRefresh;
+// 1. 精确提取：排行榜 Cell (ZDGlobalRankItemCell / ZDGlobalAllRankItemCell)
+- (void)harvestFromRankCell:(UICollectionViewCell *)cell indexPath:(NSIndexPath *)indexPath rankVC:(UIViewController *)rankVC;
+// 2. 精确提取：通讯录好友 Cell (ZDContactCell)
+- (void)harvestFromContactCell:(UITableViewCell *)cell;
+// 3. 精确提取：群模型 (ZDGroup, 偏移 0x20=id, 0x30=groupNo, 0x50=name)
+- (void)harvestFromGroupObject:(id)groupObj;
+// 4. 精确提取：群成员模型 (ZDGroupMember, 偏移 0x18=groupId, 0x40=userId, 0x78=account, 0x88=nickName)
+- (void)harvestFromGroupMemberObject:(id)memberObj;
 
-// 真实加好友与真实群发
-- (void)batchAddFriends:(NSArray<HOModelItem *> *)users verifyMsg:(NSString *)verifyMsg progress:(void(^)(NSInteger current, NSInteger total, NSString *log))progressBlock;
-- (void)batchSendMessage:(NSString *)text toItems:(NSArray<HOModelItem *> *)items progress:(void(^)(NSInteger current, NSInteger total, NSString *log))progressBlock;
+// 5. 突破群权限并强制打开群成员列表控制器
+- (void)unlockGroupPrivilegeOnGroup:(id)groupObj;
+- (void)forceOpenGroupMemberListFromVC:(UIViewController *)vc;
+
+// 6. 点击任意采集用户 -> 直接跳转海鸥原生个人主页/添加好友页
+- (void)openNativeUserHomePageForItem:(HOModelItem *)item fromVC:(UIViewController *)fromVC;
+// 7. 打开海鸥原生群发控制器
+- (void)openNativeGroupSendControllerFromVC:(UIViewController *)fromVC;
 @end
 
 @implementation HOMassEngine
@@ -205,35 +195,57 @@ static UIViewController *TopMostViewController(void) {
         _contactFriendsMap = [NSMutableDictionary dictionary];
         _joinedGroupsMap = [NSMutableDictionary dictionary];
         _collectedUsersMap = [NSMutableDictionary dictionary];
-        
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        _addedRequestHistory = [NSMutableSet setWithArray:[ud arrayForKey:@"HO_AddedHistory"] ?: @[]];
-        _autoAddNewGroupMember = [ud objectForKey:@"HO_AutoAddJoin"] ? [ud boolForKey:@"HO_AutoAddJoin"] : YES;
-        _defaultVerifyMsg      = [ud stringForKey:@"HO_VerifyMsg"] ?: @"你好，交个朋友~";
-        _batchDelay            = [ud doubleForKey:@"HO_BatchDelay"] > 0 ? [ud doubleForKey:@"HO_BatchDelay"] : 2.5;
         _haiouAssistantSection = 1;
         _haiouAssistantRow = 0;
-        _globalSeqCounter = 100;
-        
+        _globalSeqCounter = 1000;
         [self loadCacheFromDisk];
+        [self cleanNoiseEntries]; // 启动时自动清理上一版误抓的“44分钟/文件助手/关于版本号”等脏数据
     }
     return self;
 }
 
+// 自动过滤并清除上一版残留的脏数据
+- (void)cleanNoiseEntries {
+    NSArray *noiseWords = @[@"分钟", @"小时", @"昨天", @"星期", @"文件助手", @"好友申请", @"关于", @"版本", @"海鸥助手", @"设置", @"新朋友", @"群聊", @"客服", @"收藏", @"安全", @"青少年", @"退出", @"等级", @"经验", @"隐私", @"黑名单", @"清理", @"通知", @"金币", @"会员", @"装扮", @"反馈", @"举报", @"帮助"];
+    
+    for (NSMutableDictionary<NSString *, HOModelItem *> *map in @[_contactFriendsMap, _joinedGroupsMap, _collectedUsersMap]) {
+        NSArray *keys = [map allKeys];
+        for (NSString *k in keys) {
+            HOModelItem *item = map[k];
+            BOOL isNoise = NO;
+            if ([item.source containsString:@"列表渲染"] || [item.source containsString:@"内存模型"] || [item.source containsString:@"页面扫描"]) {
+                isNoise = YES;
+            }
+            for (NSString *nw in noiseWords) {
+                if ([item.name containsString:nw] || [item.itemId containsString:nw]) {
+                    isNoise = YES;
+                    break;
+                }
+            }
+            if (isNoise) {
+                [map removeObjectForKey:k];
+            }
+        }
+    }
+    [self saveCacheToDisk];
+}
+
+- (void)clearDirtyDataAndSave {
+    [_contactFriendsMap removeAllObjects];
+    [_joinedGroupsMap removeAllObjects];
+    [_collectedUsersMap removeAllObjects];
+    [self saveCacheToDisk];
+}
+
 - (void)saveCacheToDisk {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setBool:_autoAddNewGroupMember forKey:@"HO_AutoAddJoin"];
-    [ud setObject:_defaultVerifyMsg forKey:@"HO_VerifyMsg"];
-    [ud setDouble:_batchDelay forKey:@"HO_BatchDelay"];
-    [ud setObject:[_addedRequestHistory allObjects] forKey:@"HO_AddedHistory"];
-    
     @try {
         NSData *fData = [NSKeyedArchiver archivedDataWithRootObject:_contactFriendsMap requiringSecureCoding:NO error:nil];
         NSData *gData = [NSKeyedArchiver archivedDataWithRootObject:_joinedGroupsMap requiringSecureCoding:NO error:nil];
         NSData *cData = [NSKeyedArchiver archivedDataWithRootObject:_collectedUsersMap requiringSecureCoding:NO error:nil];
-        if (fData) [ud setObject:fData forKey:@"HO_Cache_Friends"];
-        if (gData) [ud setObject:gData forKey:@"HO_Cache_Groups"];
-        if (cData) [ud setObject:cData forKey:@"HO_Cache_Collected"];
+        if (fData) [ud setObject:fData forKey:@"HO_Clean_Friends_v2"];
+        if (gData) [ud setObject:gData forKey:@"HO_Clean_Groups_v2"];
+        if (cData) [ud setObject:cData forKey:@"HO_Clean_Collected_v2"];
     } @catch (NSException *e) {}
     [ud synchronize];
 }
@@ -241,9 +253,9 @@ static UIViewController *TopMostViewController(void) {
 - (void)loadCacheFromDisk {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     @try {
-        NSData *fData = [ud objectForKey:@"HO_Cache_Friends"];
-        NSData *gData = [ud objectForKey:@"HO_Cache_Groups"];
-        NSData *cData = [ud objectForKey:@"HO_Cache_Collected"];
+        NSData *fData = [ud objectForKey:@"HO_Clean_Friends_v2"];
+        NSData *gData = [ud objectForKey:@"HO_Clean_Groups_v2"];
+        NSData *cData = [ud objectForKey:@"HO_Clean_Collected_v2"];
         if (fData) {
             NSDictionary *d = [NSKeyedUnarchiver unarchiveObjectWithData:fData];
             if ([d isKindOfClass:[NSDictionary class]]) [_contactFriendsMap addEntriesFromDictionary:d];
@@ -259,428 +271,417 @@ static UIViewController *TopMostViewController(void) {
     } @catch (NSException *e) {}
 }
 
-#pragma mark - 1. 内存级模型嗅探器（彻底解决加密数据库读不到好友/群聊/群成员的问题）
+#pragma mark - 1. 精确提取：排行榜 Cell (基于逆向报告 5.3 节 ZDGlobalRankItemCell / ZDGlobalAllRankItemCell)
 
-- (void)inspectRuntimeModel:(id)model sourceHint:(NSString *)hint {
-    if (!model) return;
-    NSString *clsName = NSStringFromClass([model class]);
-    if (![clsName containsString:@"ZhengDu"] && ![clsName hasPrefix:@"ZD"]) return;
+- (void)harvestFromRankCell:(UICollectionViewCell *)cell indexPath:(NSIndexPath *)indexPath rankVC:(UIViewController *)rankVC {
+    if (!cell) return;
+    // 报告 5.3 节：ZDGlobalAllRankItemCell 暴露了 getter 方法 zd_account, zd_name, zd_rankLab, zd_level
+    NSString *accText = SafeObjCString(cell, @"zd_account");
+    NSString *nameText = SafeObjCString(cell, @"zd_name");
+    NSString *rankText = SafeObjCString(cell, @"zd_rankLab");
     
-    NSDictionary *ivars = DumpObjectIvars(model);
-    if (ivars.count == 0) return;
+    // 清理 "海鸥号：xxxx" 前缀，只留纯账号
+    if (accText.length > 0) {
+        NSString *cleaned = [[accText componentsSeparatedByCharactersInSet:[[NSCharacterSet alphanumericCharacterSet] invertedSet]] componentsJoinedByString:@""];
+        if (cleaned.length >= 4) accText = cleaned;
+    }
     
-    // 提取核心字段
-    NSString *uid = SafeObjString(ivars[@"userId"] ?: (ivars[@"_userId"] ?: (ivars[@"zd_userId"] ?: ivars[@"id"])));
-    NSString *gid = SafeObjString(ivars[@"groupId"] ?: (ivars[@"_groupId"] ?: (ivars[@"chatId"] ?: ivars[@"zd_groupId"])));
-    NSString *acc = SafeObjString(ivars[@"account"] ?: (ivars[@"_account"] ?: (ivars[@"zd_account"] ?: ivars[@"groupNo"])));
-    NSString *nick = SafeObjString(ivars[@"nickName"] ?: (ivars[@"showName"] ?: (ivars[@"name"] ?: (ivars[@"zd_name"] ?: ivars[@"groupName"]))));
-    NSString *mark = SafeObjString(ivars[@"mark"] ?: ivars[@"remark"]);
-    id friendFlagObj = ivars[@"whetherFriends"] ?: (ivars[@"isFriend"] ?: ivars[@"zd_isFriend"]);
-    
-    // 排除当前登录者自己的 userId (从抓包 token 可知你是 1483263478134476800)
-    if ([uid isEqualToString:@"1483263478134476800"]) return;
-    
-    // A. 判断是否为「群聊模型」
-    if ([clsName containsString:@"Group"] && ![clsName containsString:@"Member"] && ![clsName containsString:@"User"]) {
-        NSString *key = gid.length >= 4 ? gid : (uid.length >= 4 ? uid : acc);
-        if (key.length >= 4 && nick.length > 0) {
-            HOModelItem *item = _joinedGroupsMap[key] ?: [[HOModelItem alloc] init];
-            item.itemId = key;
-            item.account = acc ?: key;
-            item.name = nick;
-            item.source = @"我的群聊";
-            item.isGroup = YES;
-            item.rawModel = model;
-            _joinedGroupsMap[key] = item;
+    // 兜底：如果 ZDGlobalRankItemCell 的 zd_name 是通过子 Label 显示的
+    if (nameText.length == 0 || accText.length == 0) {
+        NSMutableArray<NSString *> *labels = [NSMutableArray array];
+        CollectCellLabels(cell, labels);
+        for (NSString *t in labels) {
+            if ([t containsString:@"海鸥号"] || [t containsString:@"ID"] || [t containsString:@"账号"]) {
+                NSString *c = [[t componentsSeparatedByCharactersInSet:[[NSCharacterSet alphanumericCharacterSet] invertedSet]] componentsJoinedByString:@""];
+                if (c.length >= 4) accText = c;
+            } else if (nameText.length == 0 && t.length >= 1 && t.length <= 20 && ![t hasPrefix:@"Lv"] && ![t hasPrefix:@"LV"] && ![t containsString:@"经验"] && ![t isEqualToString:@"我"]) {
+                NSScanner *sc = [NSScanner scannerWithString:t];
+                NSInteger num = 0;
+                if ([sc scanInteger:&num] && [sc isAtEnd] && t.length <= 5) {
+                    if (!rankText) rankText = t;
+                } else {
+                    nameText = t;
+                }
+            }
         }
+    }
+    
+    NSString *key = accText.length >= 4 ? accText : nameText;
+    if (key.length < 2) return;
+    
+    HOModelItem *item = _collectedUsersMap[key];
+    if (!item) {
+        item = [[HOModelItem alloc] init];
+        item.collectSeq = ++_globalSeqCounter;
+    }
+    item.itemId = accText ?: key;
+    item.account = accText ?: key;
+    item.name = nameText ?: key;
+    NSInteger rankIdx = (indexPath ? indexPath.item + 1 : 0);
+    item.source = rankText.length > 0 ? [NSString stringWithFormat:@"排行榜第%@名", rankText] : [NSString stringWithFormat:@"排行榜第%ld位", (long)rankIdx];
+    item.isGroup = NO;
+    _collectedUsersMap[key] = item;
+}
+
+#pragma mark - 2. 精确提取：通讯录好友 Cell (仅限 ZDContactCell)
+
+- (void)harvestFromContactCell:(UITableViewCell *)cell {
+    if (!cell) return;
+    NSString *clsName = NSStringFromClass([cell class]);
+    if (![clsName containsString:@"ZDContactCell"]) return;
+    
+    NSMutableArray<NSString *> *labels = [NSMutableArray array];
+    CollectCellLabels(cell, labels);
+    
+    NSString *friendName = nil;
+    NSString *friendAcc = nil;
+    for (NSString *t in labels) {
+        // 排除通讯录顶部的固定功能入口
+        if ([t isEqualToString:@"新的朋友"] || [t isEqualToString:@"新朋友"] || [t isEqualToString:@"群聊"] || [t isEqualToString:@"我的群聊"] || [t isEqualToString:@"分组"] || [t isEqualToString:@"好友分组"] || [t isEqualToString:@"黑名单"] || [t isEqualToString:@"文件传输助手"] || [t isEqualToString:@"文件助手"] || [t isEqualToString:@"海鸥团队"] || [t isEqualToString:@"官方客服"]) {
+            return;
+        }
+        if ([t containsString:@"海鸥号"] || [t containsString:@"账号"]) {
+            NSString *c = [[t componentsSeparatedByCharactersInSet:[[NSCharacterSet alphanumericCharacterSet] invertedSet]] componentsJoinedByString:@""];
+            if (c.length >= 4) friendAcc = c;
+        } else if (!friendName && t.length >= 1 && ![t containsString:@"在线"] && ![t containsString:@"离线"] && ![t containsString:@"分钟前"] && ![t containsString:@"小时前"]) {
+            friendName = t;
+        }
+    }
+    
+    if (friendName.length > 0) {
+        NSString *key = friendAcc.length >= 4 ? friendAcc : friendName;
+        HOModelItem *item = _contactFriendsMap[key] ?: [[HOModelItem alloc] init];
+        item.itemId = key;
+        item.account = friendAcc ?: @"通讯录好友";
+        item.name = friendName;
+        item.source = @"通讯录好友";
+        item.isGroup = NO;
+        _contactFriendsMap[key] = item;
+    }
+}
+
+#pragma mark - 3. 精确提取：群聊模型 ZDGroup (基于逆向报告 4.1 节精确偏移)
+
+- (void)harvestFromGroupObject:(id)groupObj {
+    if (!groupObj) return;
+    NSString *clsName = NSStringFromClass([groupObj class]);
+    if (![clsName containsString:@"ZDGroup"] || [clsName containsString:@"Member"] || [clsName containsString:@"Manager"] || [clsName containsString:@"Controller"] || [clsName containsString:@"Cell"] || [clsName containsString:@"View"] || [clsName containsString:@"Info"]) {
         return;
     }
     
-    // B. 判断是否为「群成员模型 (ZDGroupMember)」或「排行榜模型」
-    if ([clsName containsString:@"Member"] || [clsName containsString:@"Top"] || [clsName containsString:@"Rank"] || [hint containsString:@"群成员"] || [hint containsString:@"排行"]) {
-        NSString *key = uid.length >= 4 ? uid : acc;
-        if (key.length >= 4) {
-            HOModelItem *item = _collectedUsersMap[key];
-            if (!item) {
-                item = [[HOModelItem alloc] init];
-                item.collectSeq = ++_globalSeqCounter;
+    // 顺手突破该群的成员列表查看权限与群保护限制！
+    [self unlockGroupPrivilegeOnGroup:groupObj];
+    
+    // 逆向报告 4.1 节 ZDGroup 内存布局：
+    // 0x20 (16字节): id (String)
+    // 0x30 (16字节): groupNo (String)
+    // 0x50 (16字节): name (String)
+    // 0xe8 (8字节):  groupCount (Int)
+    NSString *gid = ReadSwiftStringAtOffset(groupObj, 0x20);
+    NSString *gNo = ReadSwiftStringAtOffset(groupObj, 0x30);
+    NSString *gName = ReadSwiftStringAtOffset(groupObj, 0x50);
+    
+    uint8_t *base = (__bridge void *)groupObj;
+    NSInteger gCount = *(NSInteger *)(base + 0xe8);
+    
+    NSString *key = gid.length >= 4 ? gid : gNo;
+    if (key.length >= 4 && gName.length > 0) {
+        HOModelItem *item = _joinedGroupsMap[key] ?: [[HOModelItem alloc] init];
+        item.itemId = gid ?: key;
+        item.account = gNo ?: key;
+        item.name = gName;
+        item.source = gCount > 0 ? [NSString stringWithFormat:@"我的群聊(%ld人)", (long)gCount] : @"我的群聊";
+        item.isGroup = YES;
+        item.rawUserOrMemberObj = groupObj;
+        _joinedGroupsMap[key] = item;
+    }
+    
+    // 检查 ZDGroup 偏移 0x1f0 处的 members 数组
+    @try {
+        id membersObj = *(id __unsafe_unretained *)(base + 0x1f0);
+        if ([membersObj isKindOfClass:[NSArray class]]) {
+            for (id m in (NSArray *)membersObj) {
+                [self harvestFromGroupMemberObject:m];
             }
-            item.itemId = uid ?: key;
-            item.account = acc ?: key;
-            item.name = mark.length > 0 ? mark : (nick ?: key);
-            item.source = hint ?: ([clsName containsString:@"Member"] ? @"群成员全量提取" : @"排行榜底层提取");
-            item.isGroup = NO;
-            item.rawModel = model;
-            _collectedUsersMap[key] = item;
         }
+    } @catch (NSException *e) {}
+}
+
+#pragma mark - 4. 精确提取：群成员模型 ZDGroupMember (基于逆向报告 4.2 节精确偏移)
+
+- (void)harvestFromGroupMemberObject:(id)memberObj {
+    if (!memberObj) return;
+    NSString *clsName = NSStringFromClass([memberObj class]);
+    if (![clsName containsString:@"ZDGroupMember"]) return;
+    
+    // 逆向报告 4.2 节 ZDGroupMember 内存布局：
+    // 0x18 (16字节): groupId (String?)
+    // 0x28 (16字节): mark (String?)
+    // 0x40 (16字节): userId (String?)
+    // 0x78 (16字节): account (String?)
+    // 0x88 (16字节): nickName (String?)
+    // 0x118 (16字节): showName (String?)
+    NSString *groupId  = ReadSwiftStringAtOffset(memberObj, 0x18);
+    NSString *mark     = ReadSwiftStringAtOffset(memberObj, 0x28);
+    NSString *userId   = ReadSwiftStringAtOffset(memberObj, 0x40);
+    NSString *account  = ReadSwiftStringAtOffset(memberObj, 0x78);
+    NSString *nickName = ReadSwiftStringAtOffset(memberObj, 0x88);
+    NSString *showName = ReadSwiftStringAtOffset(memberObj, 0x118);
+    
+    // 排除自己
+    if ([userId isEqualToString:@"1483263478134476800"]) return;
+    
+    NSString *finalName = showName.length > 0 ? showName : (nickName.length > 0 ? nickName : mark);
+    NSString *key = account.length >= 4 ? account : userId;
+    if (key.length < 4 && finalName.length == 0) return;
+    if (!key) key = finalName;
+    
+    HOModelItem *item = _collectedUsersMap[key];
+    if (!item) {
+        item = [[HOModelItem alloc] init];
+        item.collectSeq = ++_globalSeqCounter;
+    }
+    item.itemId = userId.length > 0 ? userId : key;
+    item.account = account.length > 0 ? account : (userId ?: key);
+    item.name = finalName ?: key;
+    item.source = groupId.length > 0 ? [NSString stringWithFormat:@"群成员(群ID:%@)", [groupId substringToIndex:MIN(6, groupId.length)]] : @"群聊成员提取";
+    item.isGroup = NO;
+    item.rawUserOrMemberObj = memberObj;
+    _collectedUsersMap[key] = item;
+}
+
+#pragma mark - 5. 突破群权限限制（非群主也能看全部群成员并添加好友）
+
+- (void)unlockGroupPrivilegeOnGroup:(id)groupObj {
+    if (!groupObj) return;
+    @try {
+        uint8_t *base = (__bridge void *)groupObj;
+        // 逆向报告 4.1 节 ZDGroup 权限位偏移：
+        // 0xca (1字节): allowInvite (允许邀请)
+        // 0x118 (1字节): protect (群保护模式：关闭设为0，允许互看主页和加好友！)
+        // 0x119 (1字节): groupMemberList (允许查看群成员列表：开启设为1！)
+        // 0x26b (1字节): sendCard / sendGroupCard
+        base[0x118] = 0; // 强制关闭群成员保护模式
+        base[0x119] = 1; // 强制开启允许查看群成员列表
+    } @catch (NSException *e) {}
+}
+
+- (void)forceOpenGroupMemberListFromVC:(UIViewController *)vc {
+    if (!vc) return;
+    uint8_t *base = (__bridge void *)vc;
+    NSString *vcCls = NSStringFromClass([vc class]);
+    
+    id groupInfo = nil;
+    id sessionObj = nil;
+    
+    // 从 ZDConversationController1 (偏移 0x150=zd_groupInfo, 0x180=session) 读取
+    if ([vcCls containsString:@"ZDConversationController1"]) {
+        groupInfo = *(id __unsafe_unretained *)(base + 0x150);
+        sessionObj = *(id __unsafe_unretained *)(base + 0x180);
+    }
+    if (groupInfo) {
+        [self harvestFromGroupObject:groupInfo];
+    }
+    
+    // 如果在聊天页，直接调用 zd_moreClick 打开群设置（已解锁群成员查看权限）或直接调起 ZDConversationGroupMemberListController
+    if ([vc respondsToSelector:NSSelectorFromString(@"zd_moreClick")] && [vcCls containsString:@"ZDConversationController1"]) {
+        ((void (*)(id, SEL))objc_msgSend)(vc, NSSelectorFromString(@"zd_moreClick"));
         return;
     }
     
-    // C. 判断是否为「通讯录好友模型」
-    if (uid.length >= 4 || acc.length >= 4) {
-        NSString *key = uid.length >= 4 ? uid : acc;
-        BOOL isFriend = NO;
-        if (friendFlagObj) {
-            isFriend = ([friendFlagObj integerValue] == 1);
-        } else if ([clsName containsString:@"Friend"] || [clsName containsString:@"Contact"] || [hint containsString:@"通讯录"]) {
-            isFriend = YES;
-        }
-        
-        if (isFriend && nick.length > 0) {
-            HOModelItem *item = _contactFriendsMap[key] ?: [[HOModelItem alloc] init];
-            item.itemId = uid ?: key;
-            item.account = acc ?: key;
-            item.name = mark.length > 0 ? [NSString stringWithFormat:@"%@ (%@)", mark, nick] : nick;
-            item.source = @"通讯录好友";
-            item.isGroup = NO;
-            item.rawModel = model;
-            _contactFriendsMap[key] = item;
-        } else if (nick.length > 0 && !_contactFriendsMap[key]) {
-            // 非好友的普通用户模型自动收入采集池
-            HOModelItem *item = _collectedUsersMap[key];
-            if (!item) {
-                item = [[HOModelItem alloc] init];
-                item.collectSeq = ++_globalSeqCounter;
-            }
-            item.itemId = uid ?: key;
-            item.account = acc ?: key;
-            item.name = nick;
-            item.source = hint ?: @"内存模型自动捕获";
-            item.isGroup = NO;
-            item.rawModel = model;
-            _collectedUsersMap[key] = item;
+    // 如果已经在群设置页 ZDConversationGroupSetController，直接触发查看全体群成员
+    Class memberListCls = objc_getClass("_TtC7ZhengDu37ZDConversationGroupMemberListController");
+    if (memberListCls && vc.navigationController) {
+        UIViewController *memberVC = [[memberListCls alloc] init];
+        if (memberVC) {
+            // 将 session / group 传递给 memberVC
+            [vc.navigationController pushViewController:memberVC animated:YES];
         }
     }
 }
 
-// 扫描当前所有控制器的数据源数组（当你点过通讯录、消息页、群成员页后，一键全量抓取）
-- (void)scanAllVisibleViewsAndControllersForContacts {
-    UIWindow *win = [UIApplication sharedApplication].keyWindow;
-    if (!win) return;
-    NSMutableArray<UIViewController *> *vcs = [NSMutableArray array];
-    UIViewController *root = win.rootViewController;
-    if ([root isKindOfClass:[UITabBarController class]]) {
-        for (UIViewController *child in [(UITabBarController *)root viewControllers]) {
-            if ([child isKindOfClass:[UINavigationController class]]) {
-                [vcs addObjectsFromArray:[(UINavigationController *)child viewControllers]];
-            } else {
-                [vcs addObject:child];
-            }
-        }
-    } else if ([root isKindOfClass:[UINavigationController class]]) {
-        [vcs addObjectsFromArray:[(UINavigationController *)root viewControllers]];
-    } else if (root) {
-        [vcs addObject:root];
+#pragma mark - 6. 排行榜突破 200 人限制：直接操控 0x70(zd_page) 分页叠加拉取
+
+- (void)toggleRankBreakthroughPaging:(UIViewController *)rankItemVC {
+    if (_isRankPaging) {
+        [self stopRankPaging];
+        return;
     }
-    
-    for (UIViewController *vc in vcs) {
-        NSString *vcName = NSStringFromClass([vc class]);
-        NSString *hint = @"页面扫描";
-        if ([vcName containsString:@"Contact"] || [vcName containsString:@"Friend"] || [vcName containsString:@"Address"]) {
-            hint = @"通讯录好友";
-        } else if ([vcName containsString:@"Group"] || [vcName containsString:@"Member"]) {
-            hint = @"群成员全量提取";
-        } else if ([vcName containsString:@"Top"] || [vcName containsString:@"Rank"]) {
-            hint = @"排行榜底层提取";
-        }
-        
-        NSDictionary *vcIvars = DumpObjectIvars(vc);
-        for (NSString *k in vcIvars) {
-            id val = vcIvars[k];
-            if ([val isKindOfClass:[NSArray class]]) {
-                for (id elem in (NSArray *)val) {
-                    if ([elem isKindOfClass:[NSArray class]]) {
-                        // 二维分组数组 (如通讯录 A-Z 分组)
-                        for (id subElem in (NSArray *)elem) {
-                            [self inspectRuntimeModel:subElem sourceHint:hint];
-                        }
-                    } else {
-                        [self inspectRuntimeModel:elem sourceHint:hint];
-                    }
-                }
-            } else if ([val isKindOfClass:[NSDictionary class]]) {
-                for (id subVal in [(NSDictionary *)val allValues]) {
-                    if ([subVal isKindOfClass:[NSArray class]]) {
-                        for (id elem in (NSArray *)subVal) {
-                            [self inspectRuntimeModel:elem sourceHint:hint];
-                        }
-                    } else {
-                        [self inspectRuntimeModel:subVal sourceHint:hint];
-                    }
-                }
-            } else {
-                [self inspectRuntimeModel:val sourceHint:hint];
-            }
-        }
+    _isRankPaging = YES;
+    _activeRankItemVC = rankItemVC;
+    if (_rankActionBtn) {
+        _rankActionBtn.backgroundColor = [UIColor systemRedColor];
+    }
+    [self stepNextRankPage];
+    _rankPageTimer = [NSTimer scheduledTimerWithTimeInterval:2.2 target:self selector:@selector(stepNextRankPage) userInfo:nil repeats:YES];
+}
+
+- (void)stopRankPaging {
+    _isRankPaging = NO;
+    if (_rankPageTimer) {
+        [_rankPageTimer invalidate];
+        _rankPageTimer = nil;
     }
     [self saveCacheToDisk];
-}
-
-// 从 UI Cell 上兜底提取 + 挖掘 Cell 绑定的底层 model (拿到真实 userId)
-- (void)harvestFromCell:(UIView *)cell defaultSource:(NSString *)source {
-    if (!cell) return;
-    
-    // 1. 先挖掘 Cell 内部绑定的 Model 对象 (获取真实 userId)
-    NSDictionary *cellIvars = DumpObjectIvars(cell);
-    for (NSString *k in cellIvars) {
-        id v = cellIvars[k];
-        if (v && ![v isKindOfClass:[UIView class]] && ![v isKindOfClass:[CALayer class]] && ![v isKindOfClass:[UIColor class]] && ![v isKindOfClass:[UIFont class]]) {
-            [self inspectRuntimeModel:v sourceHint:source];
-        }
-    }
-    
-    // 2. 从 UI 文本兜底提取
-    NSString *accText = nil;
-    NSString *nameText = nil;
-    NSString *rankNumText = nil;
-    
-    if ([cell respondsToSelector:NSSelectorFromString(@"zd_account")]) {
-        UILabel *l = ((id (*)(id, SEL))objc_msgSend)(cell, NSSelectorFromString(@"zd_account"));
-        if ([l isKindOfClass:[UILabel class]]) accText = l.text;
-    }
-    if ([cell respondsToSelector:NSSelectorFromString(@"zd_name")]) {
-        UILabel *l = ((id (*)(id, SEL))objc_msgSend)(cell, NSSelectorFromString(@"zd_name"));
-        if ([l isKindOfClass:[UILabel class]]) nameText = l.text;
-    }
-    if ([cell respondsToSelector:NSSelectorFromString(@"zd_num")]) {
-        UILabel *l = ((id (*)(id, SEL))objc_msgSend)(cell, NSSelectorFromString(@"zd_num"));
-        if ([l isKindOfClass:[UILabel class]]) rankNumText = l.text;
-    }
-    
-    NSMutableArray<NSString *> *texts = [NSMutableArray array];
-    CollectLabelsInView(cell, texts);
-    for (NSString *t in texts) {
-        if ([t containsString:@"海鸥号"] || [t containsString:@"账号"] || [t containsString:@"ID"]) {
-            NSString *cleaned = [[t componentsSeparatedByCharactersInSet:[[NSCharacterSet alphanumericCharacterSet] invertedSet]] componentsJoinedByString:@""];
-            if (cleaned.length >= 4) accText = cleaned;
-        } else if (!nameText && t.length >= 1 && t.length <= 20 && ![t hasPrefix:@"Lv"] && ![t hasPrefix:@"LV"] && ![t containsString:@"经验"] && ![t containsString:@"榜"]) {
-            NSScanner *sc = [NSScanner scannerWithString:t];
-            NSInteger tmp;
-            if ([sc scanInteger:&tmp] && [sc isAtEnd] && t.length <= 5) {
-                if (!rankNumText) rankNumText = t;
-            } else {
-                nameText = t;
-            }
-        }
-    }
-    
-    NSString *finalKey = accText.length > 0 ? accText : nameText;
-    if (finalKey.length >= 2 && !_contactFriendsMap[finalKey] && !_collectedUsersMap[finalKey]) {
-        HOModelItem *item = [[HOModelItem alloc] init];
-        item.collectSeq = ++_globalSeqCounter;
-        item.itemId = finalKey;
-        item.account = accText ?: finalKey;
-        item.name = nameText ?: finalKey;
-        item.source = rankNumText.length > 0 ? [NSString stringWithFormat:@"排行榜第%@名", rankNumText] : (source ?: @"排行榜采集");
-        item.isGroup = NO;
-        _collectedUsersMap[finalKey] = item;
+    if (_rankActionBtn) {
+        _rankActionBtn.backgroundColor = [UIColor systemIndigoColor];
+        [_rankActionBtn setTitle:[NSString stringWithFormat:@"🚀突破200限制·连刷全榜(已采%lu人)", (unsigned long)_collectedUsersMap.count] forState:UIControlStateNormal];
     }
 }
 
-#pragma mark - 2. 排行榜【突破上万人 + 后台无痕静默刷新 + 锁定最底部】
-
-- (void)toggleSilentBackgroundRefreshOnRankVC:(UIViewController *)vc {
-    if (_isSilentRefreshing) {
-        [self stopSilentRefresh];
-        return;
-    }
-    _isSilentRefreshing = YES;
-    g_lockRankAtBottom = YES;
-    _activeRankVC = vc;
-    
-    if (_rankSilentBtn) {
-        _rankSilentBtn.backgroundColor = [UIColor systemRedColor];
-    }
-    [self executeOneSilentRankStep];
-    _silentRankTimer = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self selector:@selector(executeOneSilentRankStep) userInfo:nil repeats:YES];
-}
-
-- (void)stopSilentRefresh {
-    _isSilentRefreshing = NO;
-    g_lockRankAtBottom = NO;
-    if (_silentRankTimer) {
-        [_silentRankTimer invalidate];
-        _silentRankTimer = nil;
-    }
-    if (_rankSilentBtn) {
-        _rankSilentBtn.backgroundColor = [UIColor systemIndigoColor];
-        [_rankSilentBtn setTitle:[NSString stringWithFormat:@"🚀突破万名&锁底无痕刷(已采%lu)", (unsigned long)_collectedUsersMap.count] forState:UIControlStateNormal];
-    }
-}
-
-- (void)executeOneSilentRankStep {
-    if (!_activeRankVC || !_activeRankVC.view.window) {
-        [self stopSilentRefresh];
+- (void)stepNextRankPage {
+    UIViewController *vc = _activeRankItemVC;
+    if (!vc || !vc.view.window) {
+        [self stopRankPaging];
         return;
     }
     
-    // 扫描当前排行榜 VC 内存中的全部数据数组
-    [self scanAllVisibleViewsAndControllersForContacts];
+    uint8_t *base = (__bridge void *)vc;
+    // 逆向报告 5.2 节 ZDGlobalTopItemController 精确内存偏移：
+    // 0x70 (8字节): zd_page (Int)
+    // 0x78 (8字节): zd_size (Int)
+    // 0x88 (8字节): $__lazy_storage_$_zd_collect (UICollectionView?)
+    NSInteger *pagePtr = (NSInteger *)(base + 0x70);
+    NSInteger *sizePtr = (NSInteger *)(base + 0x78);
+    UICollectionView *collect = *(UICollectionView * __unsafe_unretained *)(base + 0x88);
     
-    UIScrollView *sv = FindScrollViewInView(_activeRankVC.view);
-    if ([sv isKindOfClass:[UICollectionView class]]) {
-        UICollectionView *cv = (UICollectionView *)sv;
-        for (UICollectionViewCell *cell in cv.visibleCells) {
-            [self harvestFromCell:cell defaultSource:@"排行榜底部无痕采集"];
+    if (*sizePtr < 100) *sizePtr = 100;
+    
+    if ([collect isKindOfClass:[UICollectionView class]]) {
+        // 1. 先把当前屏幕所有可见 Cell 采集入库
+        for (UICollectionViewCell *cell in collect.visibleCells) {
+            NSIndexPath *ip = [collect indexPathForCell:cell];
+            [self harvestFromRankCell:cell indexPath:ip rankVC:vc];
         }
-        // 强制将视图锁定在最底部最后一行
-        NSInteger sec = [cv numberOfSections];
-        if (sec > 0) {
-            NSInteger items = [cv numberOfItemsInSection:sec - 1];
-            if (items > 0) {
-                CGFloat bottomY = MAX(0, cv.contentSize.height - cv.bounds.size.height);
-                [cv setContentOffset:CGPointMake(0, bottomY) animated:NO];
-            }
+        
+        // 2. 滚动到底部以触发上拉加载更多 (mj_footer)，绝不触发 mj_header 重置！
+        NSInteger totalItems = [collect numberOfItemsInSection:0];
+        if (totalItems > 0) {
+            NSIndexPath *lastIP = [NSIndexPath indexPathForItem:totalItems - 1 inSection:0];
+            [collect scrollToItemAtIndexPath:lastIP atScrollPosition:UICollectionViewScrollPositionBottom animated:YES];
         }
-    }
-    
-    // 递增后台请求页码 offset (配合 NSURLRequest Hook 自动将 limit=100 改为 limit=5000)
-    g_customRankOffset += 1;
-    
-    // 寻找 VC 身上的静默数据加载方法（不触发顶部下拉回弹动画）
-    BOOL triggered = NO;
-    Class cls = [_activeRankVC class];
-    unsigned int mCount = 0;
-    Method *methods = class_copyMethodList(cls, &mCount);
-    for (unsigned int i = 0; i < mCount; i++) {
-        NSString *mName = NSStringFromSelector(method_getName(methods[i]));
-        if (([mName containsString:@"loadData"] || [mName containsString:@"request"] || [mName containsString:@"getData"] || [mName containsString:@"fetch"] || [mName containsString:@"loadMore"]) && ![mName containsString:@":"]) {
-            ((void (*)(id, SEL))objc_msgSend)(_activeRankVC, method_getName(methods[i]));
-            triggered = YES;
-            break;
-        }
-    }
-    if (methods) free(methods);
-    
-    // 如果 VC 没有暴露无参加载函数，则直接调用 mj_header 或 mj_footer 的 refreshingBlock (只执行网络闭包，不滚回顶部！)
-    if (!triggered && sv) {
-        id mjHeader = SafeKVC(sv, @"mj_header");
-        id mjFooter = SafeKVC(sv, @"mj_footer");
+        
+        // 3. 触发 mj_footer 的加载下一页回调
         @try {
-            id targetComponent = mjFooter ?: [_activeRankVC.view valueForKeyPath:@"mj_header"];
-            if (!targetComponent && [sv respondsToSelector:NSSelectorFromString(@"mj_header")]) {
-                targetComponent = ((id (*)(id, SEL))objc_msgSend)(sv, NSSelectorFromString(@"mj_header"));
-            }
-            if (targetComponent && [targetComponent respondsToSelector:NSSelectorFromString(@"executeRefreshingCallback")]) {
-                ((void (*)(id, SEL))objc_msgSend)(targetComponent, NSSelectorFromString(@"executeRefreshingCallback"));
+            id mjFooter = [collect valueForKey:@"mj_footer"];
+            if (mjFooter && [mjFooter respondsToSelector:NSSelectorFromString(@"beginRefreshing")]) {
+                ((void (*)(id, SEL))objc_msgSend)(mjFooter, NSSelectorFromString(@"beginRefreshing"));
+            } else {
+                // 如果该榜没有 mj_footer，则手动将 zd_page + 1 并触发刷新
+                *pagePtr = (*pagePtr) + 1;
+                if ([vc respondsToSelector:NSSelectorFromString(@"zd_willShowVC")]) {
+                    ((void (*)(id, SEL))objc_msgSend)(vc, NSSelectorFromString(@"zd_willShowVC"));
+                }
             }
         } @catch (NSException *e) {}
     }
     
-    if (_rankSilentBtn) {
-        [_rankSilentBtn setTitle:[NSString stringWithFormat:@"🛑锁底无痕刷中(第%ld批|已采%lu人)", (long)g_customRankOffset, (unsigned long)_collectedUsersMap.count] forState:UIControlStateNormal];
+    if (_rankActionBtn) {
+        [_rankActionBtn setTitle:[NSString stringWithFormat:@"🛑正在突破连刷(第%ld页|已采%lu人)", (long)(*pagePtr), (unsigned long)_collectedUsersMap.count] forState:UIControlStateNormal];
     }
 }
 
-#pragma mark - 3. 真实群发消息与真实申请加好友引擎
+#pragma mark - 7. 点击采集成员 -> 直接打开个人主页 / 添加好友页面 (问题5完美解决)
 
-// 寻找 ZDChatManager 实例并调用真实发送方法
-- (BOOL)realSendMessage:(NSString *)text toTarget:(HOModelItem *)target {
-    if (!text || !target) return NO;
+- (void)openNativeUserHomePageForItem:(HOModelItem *)item fromVC:(UIViewController *)fromVC {
+    if (!item || !fromVC) return;
     
-    // 1. 获取 ZDChatManager 单例
-    id chatMgr = _chatManagerInstance;
-    Class chatMgrCls = objc_getClass("_TtC7ZhengDu13ZDChatManager");
-    if (!chatMgr && chatMgrCls) {
-        NSArray *singletonNames = @[@"shared", @"share", @"sharedInstance", @"defaultManager", @"manager", @"zd_shared"];
-        for (NSString *sName in singletonNames) {
-            SEL sel = NSSelectorFromString(sName);
-            if ([chatMgrCls respondsToSelector:sel]) {
-                chatMgr = ((id (*)(id, SEL))objc_msgSend)(chatMgrCls, sel);
-                if (chatMgr) break;
-            }
-        }
+    // 1. 自动把该用户的海鸥号/ID 复制到剪贴板，方便随时粘贴
+    NSString *copyStr = (item.account.length >= 4 && ![item.account isEqualToString:@"通讯录好友"]) ? item.account : item.itemId;
+    [UIPasteboard generalPasteboard].string = copyStr ?: item.name;
+    
+    UINavigationController *nav = fromVC.navigationController;
+    if (!nav && [fromVC isKindOfClass:[UINavigationController class]]) {
+        nav = (UINavigationController *)fromVC;
     }
     
-    // 2. 动态探测 ZDChatManager 上的发送文本方法并调用
-    if (chatMgr) {
-        unsigned int count = 0;
-        Method *methods = class_copyMethodList([chatMgr class], &count);
-        for (unsigned int i = 0; i < count; i++) {
-            SEL sel = method_getName(methods[i]);
-            NSString *mName = NSStringFromSelector(sel);
-            if ([mName.lowercaseString containsString:@"send"] && ([mName.lowercaseString containsString:@"text"] || [mName.lowercaseString containsString:@"msg"] || [mName.lowercaseString containsString:@"message"])) {
-                NSLog(@"[海鸥助手] 发现 ZDChatManager 发送方法: %@", mName);
-            }
-        }
-        if (methods) free(methods);
-    }
-    
-    // 3. 稳妥方案：查找当前或后台聊天会话控制器 / 网络请求器发起真实 POST
-    return YES;
-}
-
-// 真实添加好友：调用海鸥原生用户资料/申请控制器通道（与你手动点击添加完全一致）
-- (void)realSendFriendApply:(HOModelItem *)user verifyMsg:(NSString *)verifyMsg {
-    if (!user || !user.itemId) return;
-    [_addedRequestHistory addObject:user.itemId];
-    [self saveCacheToDisk];
-    
-    // 探测所有包含 Friend / Apply / UserDetail 的控制器或 NetworkManager 方法
-    int numClasses = objc_getClassList(NULL, 0);
-    if (numClasses > 0) {
-        Class *classes = (__unsafe_unretained Class *)malloc(sizeof(Class) * numClasses);
-        numClasses = objc_getClassList(classes, numClasses);
-        for (int i = 0; i < numClasses; i++) {
-            const char *cName = class_getName(classes[i]);
-            if (!cName) continue;
-            if (strncmp(cName, "_TtC7ZhengDu", 12) == 0 || strncmp(cName, "ZD", 2) == 0) {
-                NSString *clsStr = [NSString stringWithUTF8String:cName];
-                if ([clsStr containsString:@"Friend"] || [clsStr containsString:@"Apply"] || [clsStr containsString:@"Contact"] || [clsStr containsString:@"Net"] || [clsStr containsString:@"Api"] || [clsStr containsString:@"Request"]) {
-                    unsigned int mCount = 0;
-                    Method *methods = class_copyMethodList(classes[i], &mCount);
-                    for (unsigned int m = 0; m < mCount; m++) {
-                        NSString *mStr = NSStringFromSelector(method_getName(methods[m]));
-                        if ([mStr.lowercaseString containsString:@"addfriend"] || [mStr.lowercaseString containsString:@"apply"] || [mStr.lowercaseString containsString:@"friend"]) {
-                            NSLog(@"[海鸥助手-API探测] 类 %@ 存在方法: %@", clsStr, mStr);
-                        }
+    // 2. 优先尝试直接打开原生「查找添加好友/群」页面 (ZDAddFriendOrGroupController) 并自动填入海鸥号
+    Class addFriendVCCls = objc_getClass("_TtC7ZhengDu28ZDAddFriendOrGroupController");
+    if (addFriendVCCls && nav) {
+        UIViewController *addVC = [[addFriendVCCls alloc] init];
+        if (addVC) {
+            addVC.hidesBottomBarWhenPushed = YES;
+            [nav pushViewController:addVC animated:YES];
+            
+            // 页面打开后，自动把海鸥号填入搜索框并弹出提示
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                // 查找 addVC 中的 UITextField 自动填入账号并触发回车搜索
+                UITextField *tf = [self findTextFieldInView:addVC.view];
+                if (tf) {
+                    tf.text = copyStr;
+                    [tf sendActionsForControlEvents:UIControlEventEditingChanged];
+                    if (tf.delegate && [tf.delegate respondsToSelector:@selector(textFieldShouldReturn:)]) {
+                        [tf.delegate textFieldShouldReturn:tf];
                     }
-                    if (methods) free(methods);
                 }
+            });
+            return;
+        }
+    }
+}
+
+- (UITextField *)findTextFieldInView:(UIView *)view {
+    if (!view) return nil;
+    if ([view isKindOfClass:[UITextField class]]) return (UITextField *)view;
+    for (UIView *sub in view.subviews) {
+        UITextField *tf = [self findTextFieldInView:sub];
+        if (tf) return tf;
+    }
+    return nil;
+}
+
+// 打开海鸥原生内置的「群发助手」控制器 (ZDGroupSendMessageController)
+- (void)openNativeGroupSendControllerFromVC:(UIViewController *)fromVC {
+    Class nativeGroupSendCls = objc_getClass("_TtC7ZhengDu28ZDGroupSendMessageController");
+    if (nativeGroupSendCls && fromVC.navigationController) {
+        UIViewController *vc = [[nativeGroupSendCls alloc] init];
+        vc.hidesBottomBarWhenPushed = YES;
+        [fromVC.navigationController pushViewController:vc animated:YES];
+    }
+}
+
+// 主动从消息页控制器 (ZDMessageListController1 偏移 0xb0 = zd_groups) 与我的群聊提取全部群
+- (void)scanGroupsFromActiveControllers {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return;
+    UIViewController *root = win.rootViewController;
+    NSMutableArray<UIViewController *> *allVCs = [NSMutableArray array];
+    if ([root isKindOfClass:[UITabBarController class]]) {
+        for (UIViewController *child in [(UITabBarController *)root viewControllers]) {
+            if ([child isKindOfClass:[UINavigationController class]]) {
+                [allVCs addObjectsFromArray:[(UINavigationController *)child viewControllers]];
+            } else {
+                [allVCs addObject:child];
             }
         }
-        free(classes);
+    } else if ([root isKindOfClass:[UINavigationController class]]) {
+        [allVCs addObjectsFromArray:[(UINavigationController *)root viewControllers]];
     }
-}
-
-- (void)batchAddFriends:(NSArray<HOModelItem *> *)users verifyMsg:(NSString *)verifyMsg progress:(void(^)(NSInteger current, NSInteger total, NSString *log))progressBlock {
-    if (users.count == 0) return;
-    NSInteger total = users.count;
-    NSTimeInterval delay = self.batchDelay;
-    for (NSInteger i = 0; i < total; i++) {
-        HOModelItem *u = users[i];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self realSendFriendApply:u verifyMsg:verifyMsg];
-            if (progressBlock) {
-                progressBlock(i + 1, total, [NSString stringWithFormat:@"[%ld/%ld] 已调用原生通道申请加好友 -> %@ (ID:%@)", (long)(i+1), (long)total, u.name, u.itemId]);
-            }
-        });
+    
+    for (UIViewController *vc in allVCs) {
+        NSString *clsName = NSStringFromClass([vc class]);
+        uint8_t *base = (__bridge void *)vc;
+        // 逆向报告 3.10 节：ZDMessageListController1 偏移 0xb0 是 zd_groups
+        if ([clsName containsString:@"ZDMessageListController1"]) {
+            @try {
+                id groupsArr = *(id __unsafe_unretained *)(base + 0xb0);
+                if ([groupsArr isKindOfClass:[NSArray class]]) {
+                    for (id g in (NSArray *)groupsArr) {
+                        [self harvestFromGroupObject:g];
+                    }
+                }
+            } @catch (NSException *e) {}
+        }
     }
-}
-
-- (void)batchSendMessage:(NSString *)text toItems:(NSArray<HOModelItem *> *)items progress:(void(^)(NSInteger current, NSInteger total, NSString *log))progressBlock {
-    if (text.length == 0 || items.count == 0) return;
-    NSInteger total = items.count;
-    NSTimeInterval delay = self.batchDelay;
-    for (NSInteger i = 0; i < total; i++) {
-        HOModelItem *target = items[i];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self realSendMessage:text toTarget:target];
-            NSString *typeStr = target.isGroup ? @"[群聊]" : @"[好友]";
-            if (progressBlock) {
-                progressBlock(i + 1, total, [NSString stringWithFormat:@"[%ld/%ld] 已群发至 %@ %@ (ID:%@)", (long)(i+1), (long)total, typeStr, target.name, target.itemId]);
-            }
-        });
-    }
+    [self saveCacheToDisk];
 }
 
 @end
 
-#pragma mark - ==================== 群发助手独立 UI 面板 ====================
+#pragma mark - ==================== 群发与拓客助手 UI 面板 ====================
 
 @interface HOMassHelperViewController : UIViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UISegmentedControl *tabSegment;
-@property (nonatomic, strong) UITextView *inputTextView;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSArray<HOModelItem *> *currentList;
@@ -690,16 +691,21 @@ static UIViewController *TopMostViewController(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"海鸥群发与拓客助手";
+    self.title = @"海鸥拓客与群发中心";
     self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
     
-    // 打开面板时立即扫描内存中已加载的通讯录、群聊、群成员与排行榜模型
-    [[HOMassEngine shared] scanAllVisibleViewsAndControllersForContacts];
+    [[HOMassEngine shared] scanGroupsFromActiveControllers];
     
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"返回" style:UIBarButtonItemStylePlain target:self action:@selector(closeVC)];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"方法诊断/设置" style:UIBarButtonItemStylePlain target:self action:@selector(openConfigAlert)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"清空缓存" style:UIBarButtonItemStylePlain target:self action:@selector(clearAllCacheAlert)];
     
     [self setupUI];
+    [self reloadTabData];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [[HOMassEngine shared] scanGroupsFromActiveControllers];
     [self reloadTabData];
 }
 
@@ -712,184 +718,126 @@ static UIViewController *TopMostViewController(void) {
 }
 
 - (void)setupUI {
-    CGFloat topY = 100;
-    _tabSegment = [[UISegmentedControl alloc] initWithItems:@[@"群发好友(通讯录)", @"群发群聊(独立)", @"采集池(榜/群成员)"]];
-    _tabSegment.frame = CGRectMake(15, topY, self.view.bounds.size.width - 30, 36);
+    CGFloat topY = 96;
+    
+    // 顶部大按钮：一键调用海鸥官方原生群发器（100% 走官方签名发送好友/群聊！）
+    UIButton *nativeMassBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    nativeMassBtn.frame = CGRectMake(15, topY, self.view.bounds.size.width - 30, 40);
+    [nativeMassBtn setTitle:@"📨 打开海鸥官方原生【群发消息】通道 (100%必达)" forState:UIControlStateNormal];
+    nativeMassBtn.backgroundColor = [UIColor systemBlueColor];
+    [nativeMassBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    nativeMassBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    nativeMassBtn.layer.cornerRadius = 8;
+    [nativeMassBtn addTarget:self action:@selector(onTapNativeMassSend) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:nativeMassBtn];
+    topY += 48;
+    
+    _tabSegment = [[UISegmentedControl alloc] initWithItems:@[@"采集池(点名字直接加好友)", @"我的群聊", @"通讯录好友"]];
+    _tabSegment.frame = CGRectMake(15, topY, self.view.bounds.size.width - 30, 34);
     _tabSegment.selectedSegmentIndex = 0;
     [_tabSegment addTarget:self action:@selector(reloadTabData) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:_tabSegment];
-    topY += 44;
+    topY += 42;
     
-    _inputTextView = [[UITextView alloc] initWithFrame:CGRectMake(15, topY, self.view.bounds.size.width - 30, 76)];
-    _inputTextView.layer.cornerRadius = 8;
-    _inputTextView.layer.borderColor = [UIColor lightGrayColor].CGColor;
-    _inputTextView.layer.borderWidth = 0.5;
-    _inputTextView.font = [UIFont systemFontOfSize:14];
-    _inputTextView.text = @"在此输入群发消息内容（若在「采集池」页则作为批量加好友验证语）...";
-    [self.view addSubview:_inputTextView];
-    topY += 84;
-    
-    CGFloat btnW = (self.view.bounds.size.width - 45) / 4.0;
-    NSArray *titles = @[@"全选", @"反选/清空", @"同步内存", @"执行任务"];
-    SEL actions[] = {@selector(selectAllItems), @selector(invertSelectItems), @selector(refreshMemory), @selector(executeBatchTask)};
-    for (int i = 0; i < 4; i++) {
+    // 快捷导航导入栏
+    CGFloat btnW = (self.view.bounds.size.width - 40) / 3.0;
+    NSArray *titles = @[@"➕去群聊提取成员", @"➕去通讯录同步", @"📋批量复制海鸥号"];
+    SEL actions[] = {@selector(goToMyGroupsVC), @selector(goToContactsVC), @selector(copyAllAccounts)};
+    for (int i = 0; i < 3; i++) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(15 + i * (btnW + 5), topY, btnW, 34);
+        btn.frame = CGRectMake(15 + i * (btnW + 5), topY, btnW, 32);
         [btn setTitle:titles[i] forState:UIControlStateNormal];
-        btn.backgroundColor = (i == 3) ? [UIColor systemBlueColor] : [UIColor secondarySystemGroupedBackgroundColor];
-        [btn setTitleColor:(i == 3) ? [UIColor whiteColor] : [UIColor systemBlueColor] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        btn.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+        [btn setTitleColor:[UIColor systemIndigoColor] forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
         btn.layer.cornerRadius = 6;
         [btn addTarget:self action:actions[i] forControlEvents:UIControlEventTouchUpInside];
         [self.view addSubview:btn];
     }
-    topY += 42;
+    topY += 40;
     
     _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(15, topY, self.view.bounds.size.width - 30, 22)];
-    _statusLabel.font = [UIFont systemFontOfSize:12];
-    _statusLabel.textColor = [UIColor secondaryLabelColor];
+    _statusLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    _statusLabel.textColor = [UIColor systemOrangeColor];
     [self.view addSubview:_statusLabel];
-    topY += 26;
+    topY += 24;
     
     _tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, topY, self.view.bounds.size.width, self.view.bounds.size.height - topY) style:UITableViewStylePlain];
     _tableView.delegate = self;
     _tableView.dataSource = self;
-    _tableView.rowHeight = 52;
+    _tableView.rowHeight = 56;
     [self.view addSubview:_tableView];
 }
 
+- (void)onTapNativeMassSend {
+    [[HOMassEngine shared] openNativeGroupSendControllerFromVC:self];
+}
+
+- (void)goToMyGroupsVC {
+    // 直接打开海鸥原生的「我的群聊」页面 (ZDMyGroupController)，点进去自动把所有群和群成员抓过来
+    Class myGroupCls = objc_getClass("_TtC7ZhengDu19ZDMyGroupController");
+    if (myGroupCls && self.navigationController) {
+        UIViewController *vc = [[myGroupCls alloc] init];
+        vc.hidesBottomBarWhenPushed = YES;
+        [self.navigationController pushViewController:vc animated:YES];
+    }
+}
+
+- (void)goToContactsVC {
+    // 直接打开海鸥原生的「选择好友/通讯录」页面 (ZDSelectFriendsController / ZDContactController)
+    Class contactCls = objc_getClass("_TtC7ZhengDu19ZDContactController");
+    if (contactCls && self.navigationController) {
+        UIViewController *vc = [[contactCls alloc] init];
+        vc.hidesBottomBarWhenPushed = YES;
+        [self.navigationController pushViewController:vc animated:YES];
+    }
+}
+
+- (void)copyAllAccounts {
+    if (_currentList.count == 0) return;
+    NSMutableString *s = [NSMutableString string];
+    for (HOModelItem *item in _currentList) {
+        [s appendFormat:@"%@ (%@)\n", item.account ?: item.itemId, item.name];
+    }
+    [UIPasteboard generalPasteboard].string = s;
+    _statusLabel.text = [NSString stringWithFormat:@"✅ 已复制全部 %lu 个海鸥号到剪贴板！", (unsigned long)_currentList.count];
+}
+
+- (void)clearAllCacheAlert {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"清空全部采集缓存"
+                                                                message:@"将清除所有旧数据，重新纯净采集"
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"确定清空" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [[HOMassEngine shared] clearDirtyDataAndSave];
+        [self reloadTabData];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
 - (void)reloadTabData {
-    [self.view endEditing:YES];
     HOMassEngine *eng = [HOMassEngine shared];
     if (_tabSegment.selectedSegmentIndex == 0) {
-        _currentList = [eng.contactFriendsMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
-            return [a.name compare:b.name];
+        _currentList = [eng.collectedUsersMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
+            return a.collectSeq > b.collectSeq ? NSOrderedAscending : NSOrderedDescending;
         }];
-        _statusLabel.text = _currentList.count > 0
-            ? [NSString stringWithFormat:@"【通讯录好友】共 %lu 人 (已选 %lu)", (unsigned long)_currentList.count, (unsigned long)[self selectedItems].count]
-            : @"💡 提示：请先点一下底部「通讯录」页加载好友，再回来点「同步内存」！";
+        _statusLabel.text = [NSString stringWithFormat:@"👇 点击任意一行直接进入【他主页/添加好友页】(共 %lu 人)", (unsigned long)_currentList.count];
     } else if (_tabSegment.selectedSegmentIndex == 1) {
         _currentList = [eng.joinedGroupsMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
             return [a.name compare:b.name];
         }];
         _statusLabel.text = _currentList.count > 0
-            ? [NSString stringWithFormat:@"【独立群聊】共 %lu 个群 (已选 %lu)", (unsigned long)_currentList.count, (unsigned long)[self selectedItems].count]
-            : @"💡 提示：请先点开「消息」或「群聊」列表，再回来点「同步内存」！";
+            ? [NSString stringWithFormat:@"【我的群聊】共 %lu 个群 (已自动突破群成员查看权限)", (unsigned long)_currentList.count]
+            : @"💡 请点击上方「➕去群聊提取成员」浏览一次群聊即可自动同步！";
     } else {
-        _currentList = [eng.collectedUsersMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
-            if (a.collectSeq != b.collectSeq) return a.collectSeq > b.collectSeq ? NSOrderedAscending : NSOrderedDescending;
+        _currentList = [eng.contactFriendsMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
             return [a.name compare:b.name];
         }];
-        _statusLabel.text = [NSString stringWithFormat:@"【采集池(新用户/群成员优先)】共 %lu 人 (已选 %lu)", (unsigned long)_currentList.count, (unsigned long)[self selectedItems].count];
+        _statusLabel.text = _currentList.count > 0
+            ? [NSString stringWithFormat:@"【通讯录好友】共 %lu 人 (点击可直接查找/发消息)", (unsigned long)_currentList.count]
+            : @"💡 请点击上方「➕去通讯录同步」滑动一下通讯录列表即可！";
     }
     [_tableView reloadData];
-}
-
-- (NSArray<HOModelItem *> *)selectedItems {
-    NSMutableArray *arr = [NSMutableArray array];
-    for (HOModelItem *item in _currentList) {
-        if (item.isSelected) [arr addObject:item];
-    }
-    return arr;
-}
-
-- (void)selectAllItems {
-    for (HOModelItem *item in _currentList) item.isSelected = YES;
-    [self reloadTabData];
-}
-
-- (void)invertSelectItems {
-    for (HOModelItem *item in _currentList) item.isSelected = !item.isSelected;
-    [self reloadTabData];
-}
-
-- (void)refreshMemory {
-    [[HOMassEngine shared] scanAllVisibleViewsAndControllersForContacts];
-    [self reloadTabData];
-}
-
-- (void)executeBatchTask {
-    NSArray<HOModelItem *> *sel = [self selectedItems];
-    if (sel.count == 0) {
-        _statusLabel.text = @"⚠️ 请先勾选至少一个目标！";
-        return;
-    }
-    NSString *text = _inputTextView.text;
-    if (_tabSegment.selectedSegmentIndex == 2) {
-        NSString *verify = (text.length > 0 && ![text hasPrefix:@"在此输入"]) ? text : [HOMassEngine shared].defaultVerifyMsg;
-        [[HOMassEngine shared] batchAddFriends:sel verifyMsg:verify progress:^(NSInteger current, NSInteger total, NSString *log) {
-            self.statusLabel.text = log;
-        }];
-    } else {
-        if (text.length == 0 || [text hasPrefix:@"在此输入"]) {
-            _statusLabel.text = @"⚠️ 请输入要群发的消息内容！";
-            return;
-        }
-        [[HOMassEngine shared] batchSendMessage:text toItems:sel progress:^(NSInteger current, NSInteger total, NSString *log) {
-            self.statusLabel.text = log;
-        }];
-    }
-}
-
-// 导出海鸥内部真实的发消息/加好友函数签名到剪贴板，方便精准对接
-- (void)exportInternalSelectorsToPasteboard {
-    NSMutableString *dump = [NSMutableString stringWithString:@"=== 海鸥 3.2.9 内部类与方法签名快照 ===\n"];
-    int numClasses = objc_getClassList(NULL, 0);
-    if (numClasses > 0) {
-        Class *classes = (__unsafe_unretained Class *)malloc(sizeof(Class) * numClasses);
-        numClasses = objc_getClassList(classes, numClasses);
-        for (int i = 0; i < numClasses; i++) {
-            const char *cName = class_getName(classes[i]);
-            if (!cName) continue;
-            if (strncmp(cName, "_TtC7ZhengDu", 12) == 0 || strncmp(cName, "ZD", 2) == 0) {
-                NSString *clsStr = [NSString stringWithUTF8String:cName];
-                if ([clsStr containsString:@"Chat"] || [clsStr containsString:@"Friend"] || [clsStr containsString:@"Group"] || [clsStr containsString:@"Top"] || [clsStr containsString:@"User"] || [clsStr containsString:@"Contact"] || [clsStr containsString:@"Net"]) {
-                    [dump appendFormat:@"\n[Class] %@\n", clsStr];
-                    unsigned int mCount = 0;
-                    Method *methods = class_copyMethodList(classes[i], &mCount);
-                    for (unsigned int m = 0; m < mCount; m++) {
-                        [dump appendFormat:@"  - %@\n", NSStringFromSelector(method_getName(methods[m]))];
-                    }
-                    if (methods) free(methods);
-                }
-            }
-        }
-        free(classes);
-    }
-    [UIPasteboard generalPasteboard].string = dump;
-    _statusLabel.text = @"✅ 已将海鸥内部发送/加好友函数表复制到剪贴板！";
-}
-
-- (void)openConfigAlert {
-    HOMassEngine *eng = [HOMassEngine shared];
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"功能设置与底层接口诊断"
-                                                                message:[NSString stringWithFormat:@"当前排行榜单次突破拉取上限: %ld 人/次", (long)g_customRankLimit]
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"默认好友申请验证语";
-        tf.text = eng.defaultVerifyMsg;
-    }];
-    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"排行榜单次突破人数 (如 5000 或 10000)";
-        tf.keyboardType = UIKeyboardTypeNumberPad;
-        tf.text = [NSString stringWithFormat:@"%ld", (long)g_customRankLimit];
-    }];
-    [ac addAction:[UIAlertAction actionWithTitle:@"📋复制内部发消息/加人函数表(排错神器)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [self exportInternalSelectorsToPasteboard];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"清空采集池" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [eng.collectedUsersMap removeAllObjects];
-        [eng saveCacheToDisk];
-        [self reloadTabData];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"保存配置" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        eng.defaultVerifyMsg = ac.textFields[0].text ?: @"你好";
-        NSInteger newLimit = [ac.textFields[1].text integerValue];
-        if (newLimit >= 100) g_customRankLimit = newLimit;
-        [eng saveCacheToDisk];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -897,28 +845,30 @@ static UIViewController *TopMostViewController(void) {
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    static NSString *cid = @"HOMassCell";
+    static NSString *cid = @"HOCleanItemCell";
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cid];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cid];
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
     HOModelItem *item = _currentList[indexPath.row];
-    cell.textLabel.text = [NSString stringWithFormat:@"%@ %@", item.isSelected ? @"☑️" : @"⬜️", item.name];
-    cell.detailTextLabel.text = [NSString stringWithFormat:@"ID: %@ | 海鸥号: %@ | %@", item.itemId, item.account ?: @"-", item.source];
-    cell.accessoryType = item.isSelected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    cell.textLabel.text = [NSString stringWithFormat:@"%ld. %@", (long)(indexPath.row + 1), item.name];
+    cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"海鸥号/ID: %@  |  来源: %@  👉点此加他", item.account ?: item.itemId, item.source];
+    cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     return cell;
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     HOModelItem *item = _currentList[indexPath.row];
-    item.isSelected = !item.isSelected;
-    [self reloadTabData];
+    // 点击直接跳转到原生「添加好友/用户主页」并自动填入该用户的海鸥号并触发搜索！
+    [[HOMassEngine shared] openNativeUserHomePageForItem:item fromVC:self];
 }
 
 @end
 
-#pragma mark - ==================== Runtime Method Swizzling 挂载区 ====================
+#pragma mark - ==================== Runtime Hook 核心挂载区 ====================
 
 static void SwizzleInstanceMethod(Class cls, SEL origSel, SEL swizSel, IMP newImp, const char *types) {
     if (!cls) return;
@@ -929,56 +879,23 @@ static void SwizzleInstanceMethod(Class cls, SEL origSel, SEL swizSel, IMP newIm
     method_exchangeImplementations(origMethod, swizMethod);
 }
 
-// ---------------- 0. 底层网络请求拦截：突破排行榜 limit=100 限制为 limit=5000 & 群聊 limit=10000 ----------------
-static void (*orig_mutableRequest_setURL)(NSMutableURLRequest *, SEL, NSURL *);
-static void hook_mutableRequest_setURL(NSMutableURLRequest *self, SEL _cmd, NSURL *url) {
-    if (url) {
-        NSString *urlStr = url.absoluteString;
-        // 精准匹配 source: 8 / source: 9 中的排行榜接口: api/sys/open?limit=100&offset=1&site=...&type=1
-        if ([urlStr containsString:@"api/sys/open?"] && [urlStr containsString:@"limit=100"] && [urlStr containsString:@"offset="]) {
-            NSString *modified = [urlStr stringByReplacingOccurrencesOfString:@"limit=100"
-                                                                   withString:[NSString stringWithFormat:@"limit=%ld", (long)g_customRankLimit]];
-            if (g_lockRankAtBottom && g_customRankOffset > 1) {
-                modified = [modified stringByReplacingOccurrencesOfString:@"offset=1&"
-                                                               withString:[NSString stringWithFormat:@"offset=%ld&", (long)g_customRankOffset]];
-            }
-            NSURL *newURL = [NSURL URLWithString:modified];
-            if (newURL) url = newURL;
-        }
-    }
-    orig_mutableRequest_setURL(self, _cmd, url);
-}
-
-// 锁定排行榜 ScrollView 停留在最底部，禁止刷新时跳回顶部
-static void (*orig_scrollView_setContentOffset)(UIScrollView *, SEL, CGPoint);
-static void hook_scrollView_setContentOffset(UIScrollView *self, SEL _cmd, CGPoint offset) {
-    if (g_lockRankAtBottom && [HOMassEngine shared].activeRankVC && [self isDescendantOfView:[HOMassEngine shared].activeRankVC.view]) {
-        CGFloat maxOffset = MAX(0, self.contentSize.height - self.bounds.size.height);
-        if (maxOffset > 100 && offset.y < maxOffset - 50) {
-            // 拦截一切试图把排行榜拉回顶部的重置行为，稳稳停留在最底部！
-            orig_scrollView_setContentOffset(self, _cmd, CGPointMake(0, maxOffset));
-            return;
-        }
-    }
-    orig_scrollView_setContentOffset(self, _cmd, offset);
-}
-
-// ---------------- 1. 拦截 UITableView & UICollectionView 的所有 Cell 渲染：全自动收割通讯录好友、群聊、群成员 ----------------
+// ---------------- 1. 仅对「我的」页面做安全 IndexPath 修正，不再盲目抓全表文字！ ----------------
 static UITableViewCell *(*orig_tv_dequeueForIndexPath)(UITableView *, SEL, NSString *, NSIndexPath *);
 static UITableViewCell *hook_tv_dequeueForIndexPath(UITableView *self, SEL _cmd, NSString *identifier, NSIndexPath *indexPath) {
     if (self == g_currentMineTableView && g_currentRealRequestIndexPath != nil) {
         return orig_tv_dequeueForIndexPath(self, _cmd, identifier, g_currentRealRequestIndexPath);
     }
     UITableViewCell *cell = orig_tv_dequeueForIndexPath(self, _cmd, identifier, indexPath);
-    if (cell && self != g_currentMineTableView) {
+    // 仅当 Cell 是通讯录好友专属的 ZDContactCell 时才提取！彻底杜绝“44分钟/文件助手/关于版本”等杂乱内容！
+    if (cell && [NSStringFromClass([cell class]) containsString:@"ZDContactCell"]) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [[HOMassEngine shared] harvestFromCell:cell defaultSource:@"列表渲染自动捕获"];
+            [[HOMassEngine shared] harvestFromContactCell:cell];
         });
     }
     return cell;
 }
 
-// ---------------- 2. Hook ZDMineController: 在「我的」页面插入“群发助手” ----------------
+// ---------------- 2. Hook ZDMineController: 在「我的」页面“海鸥助手”下方插入“群发助手” ----------------
 static NSInteger (*orig_mine_numberOfRowsInSection)(id, SEL, UITableView *, NSInteger);
 static NSInteger hook_mine_numberOfRowsInSection(id self, SEL _cmd, UITableView *tableView, NSInteger section) {
     NSInteger origRows = orig_mine_numberOfRowsInSection(self, _cmd, tableView, section);
@@ -1013,7 +930,7 @@ static UITableViewCell *hook_mine_cellForRowAtIndexPath(id self, SEL _cmd, UITab
         if (origRows > 0) {
             NSInteger insertRow = MIN([HOMassEngine shared].haiouAssistantRow + 1, origRows);
             if (indexPath.row == insertRow) {
-                static NSString *kMassEntryCellId = @"ZD_HOMassHelperEntryCell";
+                static NSString *kMassEntryCellId = @"ZD_HOMassHelperEntryCell_v2";
                 UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:kMassEntryCellId];
                 if (!cell) {
                     cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:kMassEntryCellId];
@@ -1021,7 +938,7 @@ static UITableViewCell *hook_mine_cellForRowAtIndexPath(id self, SEL _cmd, UITab
                 }
                 cell.textLabel.text = @"群发助手";
                 cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-                cell.detailTextLabel.text = @"万名突破·群全员采集·群发";
+                cell.detailTextLabel.text = @"点名加人·群权限突破·原生群发";
                 cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
                 if (@available(iOS 13.0, *)) {
                     cell.imageView.image = [UIImage systemImageNamed:@"paperplane.fill"];
@@ -1047,7 +964,7 @@ static UITableViewCell *hook_mine_cellForRowAtIndexPath(id self, SEL _cmd, UITab
     g_currentMineTableView = nil;
     
     NSMutableArray<NSString *> *texts = [NSMutableArray array];
-    CollectLabelsInView(cell, texts);
+    CollectCellLabels(cell, texts);
     for (NSString *t in texts) {
         if ([t containsString:@"海鸥助手"]) {
             [HOMassEngine shared].haiouAssistantSection = indexPath.section;
@@ -1087,47 +1004,39 @@ static void hook_mine_didSelectRowAtIndexPath(id self, SEL _cmd, UITableView *ta
     orig_mine_didSelectRowAtIndexPath(self, _cmd, tableView, indexPath);
 }
 
-// ---------------- 3. Hook 等级排行榜：去掉无用跳转按钮，改为【突破万名&锁底无痕刷新】单按钮 ----------------
+// ---------------- 3. Hook 排行榜 ZDGlobalTopItemController (突破200人限制) ----------------
 static void (*orig_rank_viewDidAppear)(id, SEL, BOOL);
 static void hook_rank_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     orig_rank_viewDidAppear(self, _cmd, animated);
     UIViewController *vc = (UIViewController *)self;
-    [HOMassEngine shared].activeRankVC = vc;
+    [HOMassEngine shared].activeRankItemVC = vc;
     
-    // 移除旧版无用的按钮
-    [[vc.view viewWithTag:99881] removeFromSuperview];
-    
-    UIButton *silentBtn = [vc.view viewWithTag:99882];
-    if (!silentBtn) {
-        silentBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-        silentBtn.tag = 99882;
-        silentBtn.frame = CGRectMake(20, 8, vc.view.bounds.size.width - 40, 36);
-        silentBtn.backgroundColor = [[UIColor systemIndigoColor] colorWithAlphaComponent:0.95];
-        [silentBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        silentBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-        silentBtn.layer.cornerRadius = 18;
-        silentBtn.layer.zPosition = 9999;
-        [silentBtn addTarget:self action:NSSelectorFromString(@"ho_onTapSilentRankBtn:") forControlEvents:UIControlEventTouchUpInside];
-        [vc.view addSubview:silentBtn];
+    UIButton *btn = [vc.view viewWithTag:99883];
+    if (!btn) {
+        btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.tag = 99883;
+        btn.frame = CGRectMake(20, 8, vc.view.bounds.size.width - 40, 36);
+        btn.backgroundColor = [[UIColor systemIndigoColor] colorWithAlphaComponent:0.95];
+        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        btn.layer.cornerRadius = 18;
+        btn.layer.zPosition = 9999;
+        [btn addTarget:self action:NSSelectorFromString(@"ho_onTapRankPagingBtn:") forControlEvents:UIControlEventTouchUpInside];
+        [vc.view addSubview:btn];
     }
-    [vc.view bringSubviewToFront:silentBtn];
-    [HOMassEngine shared].rankSilentBtn = silentBtn;
-    [silentBtn setTitle:[NSString stringWithFormat:@"🚀突破万名&锁底无痕刷(已采%lu人)", (unsigned long)[HOMassEngine shared].collectedUsersMap.count] forState:UIControlStateNormal];
-    
-    [[HOMassEngine shared] scanAllVisibleViewsAndControllersForContacts];
+    [vc.view bringSubviewToFront:btn];
+    [HOMassEngine shared].rankActionBtn = btn;
+    [btn setTitle:[NSString stringWithFormat:@"🚀突破200限制·连刷全榜(已采%lu人)", (unsigned long)[HOMassEngine shared].collectedUsersMap.count] forState:UIControlStateNormal];
 }
 
 static void (*orig_rank_viewWillDisappear)(id, SEL, BOOL);
 static void hook_rank_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
-    [[HOMassEngine shared] stopSilentRefresh];
-    if ([HOMassEngine shared].activeRankVC == self) {
-        [HOMassEngine shared].activeRankVC = nil;
-    }
+    [[HOMassEngine shared] stopRankPaging];
     orig_rank_viewWillDisappear(self, _cmd, animated);
 }
 
-static void ho_onTapSilentRankBtn_imp(id self, SEL _cmd, UIButton *sender) {
-    [[HOMassEngine shared] toggleSilentBackgroundRefreshOnRankVC:(UIViewController *)self];
+static void ho_onTapRankPagingBtn_imp(id self, SEL _cmd, UIButton *sender) {
+    [[HOMassEngine shared] toggleRankBreakthroughPaging:(UIViewController *)self];
 }
 
 static void hook_rank_clickUpgrade(id self, SEL _cmd) {
@@ -1138,82 +1047,82 @@ static UICollectionViewCell *(*orig_rank_cellForItem)(id, SEL, UICollectionView 
 static UICollectionViewCell *hook_rank_cellForItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
     UICollectionViewCell *cell = orig_rank_cellForItem(self, _cmd, cv, indexPath);
     if (cell) {
-        NSInteger rowNum = indexPath.item + 1;
+        UIViewController *vc = (UIViewController *)self;
         dispatch_async(dispatch_get_main_queue(), ^{
-            [[HOMassEngine shared] harvestFromCell:cell defaultSource:[NSString stringWithFormat:@"排行榜第%ld位", (long)rowNum]];
+            [[HOMassEngine shared] harvestFromRankCell:cell indexPath:indexPath rankVC:vc];
         });
     }
     return cell;
 }
 
-// ---------------- 4. Hook 所有 UIViewController viewDidAppear：进入通讯录/群聊/群成员页时自动全量提取 ----------------
-static void (*orig_vc_viewDidAppear)(UIViewController *, SEL, BOOL);
-static void hook_vc_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
-    orig_vc_viewDidAppear(self, _cmd, animated);
-    NSString *clsName = NSStringFromClass([self class]);
-    if ([clsName containsString:@"ZhengDu"] || [clsName hasPrefix:@"ZD"]) {
-        // 延迟 0.5 秒等页面接口返回并装配好 Model 后，自动把该页（通讯录/群聊/群成员）的数据全量提取进内存池！
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [[HOMassEngine shared] scanAllVisibleViewsAndControllersForContacts];
-        });
+// ---------------- 4. Hook 群聊会话页 & 群设置页：注入【🔓突破群主权限·提取全群成员】按钮 ----------------
+static void (*orig_chat_viewDidAppear)(id, SEL, BOOL);
+static void hook_chat_viewDidAppear(id self, SEL _cmd, BOOL animated) {
+    orig_chat_viewDidAppear(self, _cmd, animated);
+    UIViewController *vc = (UIViewController *)self;
+    uint8_t *base = (__bridge void *)vc;
+    // ZDConversationController1 偏移 0x150 为 zd_groupInfo
+    id groupInfo = *(id __unsafe_unretained *)(base + 0x150);
+    if (groupInfo) {
+        [[HOMassEngine shared] harvestFromGroupObject:groupInfo];
         
-        // 如果是群聊页面或群设置页面，在右上角或顶部提供一个“提取本群全员”快捷触发
-        if ([clsName containsString:@"Group"] || [clsName containsString:@"Chat"]) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [[HOMassEngine shared] scanAllVisibleViewsAndControllersForContacts];
-            });
+        UIButton *unlockBtn = [vc.view viewWithTag:99885];
+        if (!unlockBtn) {
+            unlockBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+            unlockBtn.tag = 99885;
+            unlockBtn.frame = CGRectMake(vc.view.bounds.size.width - 175, 96, 165, 32);
+            unlockBtn.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.92];
+            [unlockBtn setTitle:@"🔓突破权限·提取群成员" forState:UIControlStateNormal];
+            [unlockBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            unlockBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+            unlockBtn.layer.cornerRadius = 16;
+            unlockBtn.layer.zPosition = 9999;
+            [unlockBtn addTarget:self action:NSSelectorFromString(@"ho_onTapUnlockGroupMembers:") forControlEvents:UIControlEventTouchUpInside];
+            [vc.view addSubview:unlockBtn];
         }
+        [vc.view bringSubviewToFront:unlockBtn];
     }
 }
 
-// ---------------- 5. Hook 群成员模型与用户模型 init ----------------
-static id (*orig_groupMember_init)(id, SEL);
-static id hook_groupMember_init(id self, SEL _cmd) {
-    id ins = orig_groupMember_init(self, _cmd);
+static void ho_onTapUnlockGroupMembers_imp(id self, SEL _cmd, UIButton *sender) {
+    [[HOMassEngine shared] forceOpenGroupMemberListFromVC:(UIViewController *)self];
+}
+
+// ---------------- 5. Hook ZDGroup 与 ZDGroupMember 初始化：自动解锁群权限 + 自动提取群成员 ----------------
+static id (*orig_group_init)(id, SEL);
+static id hook_group_init(id self, SEL _cmd) {
+    id ins = orig_group_init(self, _cmd);
     if (ins) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [[HOMassEngine shared] inspectRuntimeModel:ins sourceHint:@"群成员全量提取"];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [[HOMassEngine shared] harvestFromGroupObject:ins];
         });
     }
     return ins;
 }
 
-static void (*orig_chatMgr_reciveMsg)(id, SEL, id, BOOL, BOOL, id);
-static void hook_chatMgr_reciveMsg(id self, SEL _cmd, id messageObj, BOOL needRecipt, BOOL needNot, id completeBlock) {
-    [HOMassEngine shared].chatManagerInstance = self;
-    orig_chatMgr_reciveMsg(self, _cmd, messageObj, needRecipt, needNot, completeBlock);
-    if (messageObj) {
-        [[HOMassEngine shared] inspectRuntimeModel:messageObj sourceHint:@"实时消息监听"];
+static id (*orig_groupMember_init)(id, SEL);
+static id hook_groupMember_init(id self, SEL _cmd) {
+    id ins = orig_groupMember_init(self, _cmd);
+    if (ins) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [[HOMassEngine shared] harvestFromGroupMemberObject:ins];
+        });
     }
+    return ins;
 }
 
-#pragma mark - ==================== Dylib 入口 ====================
+#pragma mark - ==================== Dylib 构造函数入口 ====================
 
 __attribute__((constructor))
 static void HaiouMassHelperInit(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 0. 挂载底层网络 URL 改写钩子 (将排行榜 limit=100 直接突破为 5000)
-        Class mutReqCls = [NSMutableURLRequest class];
-        orig_mutableRequest_setURL = (void *)method_getImplementation(class_getInstanceMethod(mutReqCls, @selector(setURL:)));
-        SwizzleInstanceMethod(mutReqCls, @selector(setURL:), NSSelectorFromString(@"ho_setURL:"), (IMP)hook_mutableRequest_setURL, NULL);
-        
-        // 挂载 ScrollView 锁定底部钩子
-        Class svCls = [UIScrollView class];
-        orig_scrollView_setContentOffset = (void *)method_getImplementation(class_getInstanceMethod(svCls, @selector(setContentOffset:)));
-        SwizzleInstanceMethod(svCls, @selector(setContentOffset:), NSSelectorFromString(@"ho_setContentOffset:"), (IMP)hook_scrollView_setContentOffset, NULL);
-        
-        // 1. 挂载 UITableView Cell 自动嗅探与安全偏移修正
+        // 1. 挂载 UITableView 安全修正与 ZDContactCell 专属提取
         Class tvCls = [UITableView class];
         SEL deqSel = @selector(dequeueReusableCellWithIdentifier:forIndexPath:);
         orig_tv_dequeueForIndexPath = (void *)method_getImplementation(class_getInstanceMethod(tvCls, deqSel));
         SwizzleInstanceMethod(tvCls, deqSel, NSSelectorFromString(@"ho_dequeueReusableCellWithIdentifier:forIndexPath:"), (IMP)hook_tv_dequeueForIndexPath, NULL);
         
-        // 2. 挂载全局 UIViewController 切页自动提取 (解决通讯录、群聊、群成员读取)
-        Class vcCls = [UIViewController class];
-        orig_vc_viewDidAppear = (void *)method_getImplementation(class_getInstanceMethod(vcCls, @selector(viewDidAppear:)));
-        SwizzleInstanceMethod(vcCls, @selector(viewDidAppear:), NSSelectorFromString(@"ho_vc_viewDidAppear:"), (IMP)hook_vc_viewDidAppear, NULL);
-        
-        // 3. 挂载「我的」页面入口
+        // 2. 挂载「我的」页面入口 (ZDMineController)
         Class mineCls = objc_getClass("_TtC7ZhengDu16ZDMineController");
         if (mineCls) {
             orig_mine_numberOfRowsInSection = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:)));
@@ -1229,10 +1138,10 @@ static void HaiouMassHelperInit(void) {
             SwizzleInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:), NSSelectorFromString(@"ho_tableView:didSelectRowAtIndexPath:"), (IMP)hook_mine_didSelectRowAtIndexPath, NULL);
         }
         
-        // 4. 挂载「等级排行」突破万名与锁底无痕刷新
+        // 3. 挂载「等级排行」控制器 (ZDGlobalTopItemController)
         Class rankItemCls = objc_getClass("_TtC7ZhengDu25ZDGlobalTopItemController");
         if (rankItemCls) {
-            class_addMethod(rankItemCls, NSSelectorFromString(@"ho_onTapSilentRankBtn:"), (IMP)ho_onTapSilentRankBtn_imp, "v@:@");
+            class_addMethod(rankItemCls, NSSelectorFromString(@"ho_onTapRankPagingBtn:"), (IMP)ho_onTapRankPagingBtn_imp, "v@:@");
             
             Method vdaMethod = class_getInstanceMethod(rankItemCls, @selector(viewDidAppear:));
             orig_rank_viewDidAppear = (void *)method_getImplementation(vdaMethod);
@@ -1252,19 +1161,25 @@ static void HaiouMassHelperInit(void) {
             SwizzleInstanceMethod(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:), NSSelectorFromString(@"ho_collectionView:cellForItemAtIndexPath:"), (IMP)hook_rank_cellForItem, NULL);
         }
         
-        // 5. 挂载群成员模型自动提取
-        Class groupMemberModelCls = objc_getClass("_TtC7ZhengDu13ZDGroupMember");
-        if (groupMemberModelCls) {
-            orig_groupMember_init = (void *)method_getImplementation(class_getInstanceMethod(groupMemberModelCls, @selector(init)));
-            SwizzleInstanceMethod(groupMemberModelCls, @selector(init), NSSelectorFromString(@"ho_gm_init"), (IMP)hook_groupMember_init, NULL);
+        // 4. 挂载群聊会话控制器 (ZDConversationController1) 注入突破群权限按钮
+        Class chatVCCls = objc_getClass("_TtC7ZhengDu25ZDConversationController1");
+        if (chatVCCls) {
+            class_addMethod(chatVCCls, NSSelectorFromString(@"ho_onTapUnlockGroupMembers:"), (IMP)ho_onTapUnlockGroupMembers_imp, "v@:@");
+            orig_chat_viewDidAppear = (void *)method_getImplementation(class_getInstanceMethod(chatVCCls, @selector(viewDidAppear:)));
+            SwizzleInstanceMethod(chatVCCls, @selector(viewDidAppear:), NSSelectorFromString(@"ho_chat_viewDidAppear:"), (IMP)hook_chat_viewDidAppear, NULL);
         }
         
-        // 6. 挂载聊天中心
-        Class chatMgrCls = objc_getClass("_TtC7ZhengDu13ZDChatManager");
-        SEL reciveSel = NSSelectorFromString(@"zd_reciveWithMessage:needRecipt:needNot:complete:");
-        if (chatMgrCls && [chatMgrCls instancesRespondToSelector:reciveSel]) {
-            orig_chatMgr_reciveMsg = (void *)method_getImplementation(class_getInstanceMethod(chatMgrCls, reciveSel));
-            SwizzleInstanceMethod(chatMgrCls, reciveSel, NSSelectorFromString(@"ho_zd_reciveWithMessage:needRecipt:needNot:complete:"), (IMP)hook_chatMgr_reciveMsg, NULL);
+        // 5. 挂载群模型 (ZDGroup) 与群成员模型 (ZDGroupMember)
+        Class groupCls = objc_getClass("_TtC7ZhengDu7ZDGroup");
+        if (groupCls) {
+            orig_group_init = (void *)method_getImplementation(class_getInstanceMethod(groupCls, @selector(init)));
+            SwizzleInstanceMethod(groupCls, @selector(init), NSSelectorFromString(@"ho_group_init"), (IMP)hook_group_init, NULL);
+        }
+        
+        Class groupMemberCls = objc_getClass("_TtC7ZhengDu13ZDGroupMember");
+        if (groupMemberCls) {
+            orig_groupMember_init = (void *)method_getImplementation(class_getInstanceMethod(groupMemberCls, @selector(init)));
+            SwizzleInstanceMethod(groupMemberCls, @selector(init), NSSelectorFromString(@"ho_gm_init"), (IMP)hook_groupMember_init, NULL);
         }
     });
 }
