@@ -102,6 +102,44 @@ jobs:
           print("fixed", n, "bridge-void cast(s)")
           PY
 
+      - name: Ensure dlfcn.h import
+        run: |
+          # 源码用了 dlsym(RTLD_DEFAULT, ...) 却没 import <dlfcn.h> 时，
+          # 会报 "use of undeclared identifier 'RTLD_DEFAULT'"。此处自动补上（幂等）。
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          if ("RTLD_DEFAULT" in s or "dlsym(" in s) and "#import <dlfcn.h>" not in s:
+              lines = s.split("\n")
+              idx = 0
+              for i, ln in enumerate(lines):
+                  if ln.lstrip().startswith("#import"):
+                      idx = i + 1
+              lines.insert(idx, "#import <dlfcn.h>")
+              p.write_text("\n".join(lines))
+              print("inserted dlfcn.h import")
+          else:
+              print("dlfcn.h import present or not needed")
+          PY
+
+      - name: Fix ARC __unsafe_unretained pointer casts
+        run: |
+          # ARC 下 "*(id __unsafe_unretained *)(base + off)" 会报
+          # "cast of a non-Objective-C pointer type 'uint8_t *' to '__unsafe_unretained id *'
+          #  is disallowed with ARC"。改为先取 void* 再 __bridge 到对象类型（幂等）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          new, n = re.subn(
+              r'\*\s*\(\s*([A-Za-z_]\w*\s*\*?)\s*__unsafe_unretained\s*\*\s*\)\s*\(',
+              r'(__bridge \1)*(void **)(', s)
+          if n:
+              p.write_text(new)
+          print("fixed", n, "ARC __unsafe_unretained cast(s)")
+          PY
+
       - name: Ensure NSString altName declaration
         run: |
           # altName: 的实现位于文件后部，而调用点可能在其之前，

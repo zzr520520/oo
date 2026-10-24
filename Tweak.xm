@@ -13,6 +13,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dlfcn.h>
 
 #pragma mark - ==================== 全局状态与 Swift 内存安全读取工具 ====================
 
@@ -38,7 +39,7 @@ static NSString *SafeObjCString(id obj, NSString *selName) {
 static NSString *ReadSwiftStringAtOffset(id obj, ptrdiff_t offset) {
     if (!obj || offset <= 0) return nil;
     @try {
-        uint8_t *base = (__bridge void *)obj;
+        uint8_t *base = (uint8_t *)(__bridge void *)obj;
         uint64_t word0 = *(uint64_t *)(base + offset);
         uint64_t word1 = *(uint64_t *)(base + offset + 8);
         if (word0 == 0 && word1 == 0) return nil;
@@ -381,7 +382,7 @@ static UIViewController *TopMostVC(void) {
     NSString *gNo = ReadSwiftStringAtOffset(groupObj, 0x30);
     NSString *gName = ReadSwiftStringAtOffset(groupObj, 0x50);
     
-    uint8_t *base = (__bridge void *)groupObj;
+    uint8_t *base = (uint8_t *)(__bridge void *)groupObj;
     NSInteger gCount = *(NSInteger *)(base + 0xe8);
     
     NSString *key = gid.length >= 4 ? gid : gNo;
@@ -398,7 +399,7 @@ static UIViewController *TopMostVC(void) {
     
     // 检查 ZDGroup 偏移 0x1f0 处的 members 数组
     @try {
-        id membersObj = *(id __unsafe_unretained *)(base + 0x1f0);
+        id membersObj = (__bridge id)*(void **)(base + 0x1f0);
         if ([membersObj isKindOfClass:[NSArray class]]) {
             for (id m in (NSArray *)membersObj) {
                 [self harvestFromGroupMemberObject:m];
@@ -455,7 +456,7 @@ static UIViewController *TopMostVC(void) {
 - (void)unlockGroupPrivilegeOnGroup:(id)groupObj {
     if (!groupObj) return;
     @try {
-        uint8_t *base = (__bridge void *)groupObj;
+        uint8_t *base = (uint8_t *)(__bridge void *)groupObj;
         // 逆向报告 4.1 节 ZDGroup 权限位偏移：
         // 0xca (1字节): allowInvite (允许邀请)
         // 0x118 (1字节): protect (群保护模式：关闭设为0，允许互看主页和加好友！)
@@ -468,7 +469,7 @@ static UIViewController *TopMostVC(void) {
 
 - (void)forceOpenGroupMemberListFromVC:(UIViewController *)vc {
     if (!vc) return;
-    uint8_t *base = (__bridge void *)vc;
+    uint8_t *base = (uint8_t *)(__bridge void *)vc;
     NSString *vcCls = NSStringFromClass([vc class]);
     
     id groupInfo = nil;
@@ -476,8 +477,8 @@ static UIViewController *TopMostVC(void) {
     
     // 从 ZDConversationController1 (偏移 0x150=zd_groupInfo, 0x180=session) 读取
     if ([vcCls containsString:@"ZDConversationController1"]) {
-        groupInfo = *(id __unsafe_unretained *)(base + 0x150);
-        sessionObj = *(id __unsafe_unretained *)(base + 0x180);
+        groupInfo = (__bridge id)*(void **)(base + 0x150);
+        sessionObj = (__bridge id)*(void **)(base + 0x180);
     }
     if (groupInfo) {
         [self harvestFromGroupObject:groupInfo];
@@ -536,14 +537,14 @@ static UIViewController *TopMostVC(void) {
         return;
     }
     
-    uint8_t *base = (__bridge void *)vc;
+    uint8_t *base = (uint8_t *)(__bridge void *)vc;
     // 逆向报告 5.2 节 ZDGlobalTopItemController 精确内存偏移：
     // 0x70 (8字节): zd_page (Int)
     // 0x78 (8字节): zd_size (Int)
     // 0x88 (8字节): $__lazy_storage_$_zd_collect (UICollectionView?)
     NSInteger *pagePtr = (NSInteger *)(base + 0x70);
     NSInteger *sizePtr = (NSInteger *)(base + 0x78);
-    UICollectionView *collect = *(UICollectionView * __unsafe_unretained *)(base + 0x88);
+    UICollectionView *collect = (__bridge UICollectionView *)*(void **)(base + 0x88);
     
     if (*sizePtr < 100) *sizePtr = 100;
     
@@ -660,11 +661,11 @@ static UIViewController *TopMostVC(void) {
     
     for (UIViewController *vc in allVCs) {
         NSString *clsName = NSStringFromClass([vc class]);
-        uint8_t *base = (__bridge void *)vc;
+        uint8_t *base = (uint8_t *)(__bridge void *)vc;
         // 逆向报告 3.10 节：ZDMessageListController1 偏移 0xb0 是 zd_groups
         if ([clsName containsString:@"ZDMessageListController1"]) {
             @try {
-                id groupsArr = *(id __unsafe_unretained *)(base + 0xb0);
+                id groupsArr = (__bridge id)*(void **)(base + 0xb0);
                 if ([groupsArr isKindOfClass:[NSArray class]]) {
                     for (id g in (NSArray *)groupsArr) {
                         [self harvestFromGroupObject:g];
@@ -1060,9 +1061,9 @@ static void (*orig_chat_viewDidAppear)(id, SEL, BOOL);
 static void hook_chat_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     orig_chat_viewDidAppear(self, _cmd, animated);
     UIViewController *vc = (UIViewController *)self;
-    uint8_t *base = (__bridge void *)vc;
+    uint8_t *base = (uint8_t *)(__bridge void *)vc;
     // ZDConversationController1 偏移 0x150 为 zd_groupInfo
-    id groupInfo = *(id __unsafe_unretained *)(base + 0x150);
+    id groupInfo = (__bridge id)*(void **)(base + 0x150);
     if (groupInfo) {
         [[HOMassEngine shared] harvestFromGroupObject:groupInfo];
         
@@ -1119,22 +1120,22 @@ static void HaiouMassHelperInit(void) {
         // 1. 挂载 UITableView 安全修正与 ZDContactCell 专属提取
         Class tvCls = [UITableView class];
         SEL deqSel = @selector(dequeueReusableCellWithIdentifier:forIndexPath:);
-        orig_tv_dequeueForIndexPath = (void *)method_getImplementation(class_getInstanceMethod(tvCls, deqSel));
+        orig_tv_dequeueForIndexPath = (__typeof__(orig_tv_dequeueForIndexPath))method_getImplementation(class_getInstanceMethod(tvCls, deqSel));
         SwizzleInstanceMethod(tvCls, deqSel, NSSelectorFromString(@"ho_dequeueReusableCellWithIdentifier:forIndexPath:"), (IMP)hook_tv_dequeueForIndexPath, NULL);
         
         // 2. 挂载「我的」页面入口 (ZDMineController)
         Class mineCls = objc_getClass("_TtC7ZhengDu16ZDMineController");
         if (mineCls) {
-            orig_mine_numberOfRowsInSection = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:)));
+            orig_mine_numberOfRowsInSection = (__typeof__(orig_mine_numberOfRowsInSection))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:), NSSelectorFromString(@"ho_tableView:numberOfRowsInSection:"), (IMP)hook_mine_numberOfRowsInSection, NULL);
             
-            orig_mine_heightForRowAtIndexPath = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:heightForRowAtIndexPath:)));
+            orig_mine_heightForRowAtIndexPath = (__typeof__(orig_mine_heightForRowAtIndexPath))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:heightForRowAtIndexPath:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:heightForRowAtIndexPath:), NSSelectorFromString(@"ho_tableView:heightForRowAtIndexPath:"), (IMP)hook_mine_heightForRowAtIndexPath, NULL);
             
-            orig_mine_cellForRowAtIndexPath = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:)));
+            orig_mine_cellForRowAtIndexPath = (__typeof__(orig_mine_cellForRowAtIndexPath))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:), NSSelectorFromString(@"ho_tableView:cellForRowAtIndexPath:"), (IMP)hook_mine_cellForRowAtIndexPath, NULL);
             
-            orig_mine_didSelectRowAtIndexPath = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:)));
+            orig_mine_didSelectRowAtIndexPath = (__typeof__(orig_mine_didSelectRowAtIndexPath))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:), NSSelectorFromString(@"ho_tableView:didSelectRowAtIndexPath:"), (IMP)hook_mine_didSelectRowAtIndexPath, NULL);
         }
         
@@ -1144,20 +1145,20 @@ static void HaiouMassHelperInit(void) {
             class_addMethod(rankItemCls, NSSelectorFromString(@"ho_onTapRankPagingBtn:"), (IMP)ho_onTapRankPagingBtn_imp, "v@:@");
             
             Method vdaMethod = class_getInstanceMethod(rankItemCls, @selector(viewDidAppear:));
-            orig_rank_viewDidAppear = (void *)method_getImplementation(vdaMethod);
+            orig_rank_viewDidAppear = (__typeof__(orig_rank_viewDidAppear))method_getImplementation(vdaMethod);
             if (!class_addMethod(rankItemCls, @selector(viewDidAppear:), (IMP)hook_rank_viewDidAppear, method_getTypeEncoding(vdaMethod))) {
                 SwizzleInstanceMethod(rankItemCls, @selector(viewDidAppear:), NSSelectorFromString(@"ho_rank_viewDidAppear:"), (IMP)hook_rank_viewDidAppear, NULL);
             }
             
             Method vwdMethod = class_getInstanceMethod(rankItemCls, @selector(viewWillDisappear:));
-            orig_rank_viewWillDisappear = (void *)method_getImplementation(vwdMethod);
+            orig_rank_viewWillDisappear = (__typeof__(orig_rank_viewWillDisappear))method_getImplementation(vwdMethod);
             if (!class_addMethod(rankItemCls, @selector(viewWillDisappear:), (IMP)hook_rank_viewWillDisappear, method_getTypeEncoding(vwdMethod))) {
                 SwizzleInstanceMethod(rankItemCls, @selector(viewWillDisappear:), NSSelectorFromString(@"ho_rank_viewWillDisappear:"), (IMP)hook_rank_viewWillDisappear, NULL);
             }
             
             SwizzleInstanceMethod(rankItemCls, NSSelectorFromString(@"zd_clickUpgrade"), NSSelectorFromString(@"ho_zd_clickUpgrade"), (IMP)hook_rank_clickUpgrade, NULL);
             
-            orig_rank_cellForItem = (void *)method_getImplementation(class_getInstanceMethod(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:)));
+            orig_rank_cellForItem = (__typeof__(orig_rank_cellForItem))method_getImplementation(class_getInstanceMethod(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:)));
             SwizzleInstanceMethod(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:), NSSelectorFromString(@"ho_collectionView:cellForItemAtIndexPath:"), (IMP)hook_rank_cellForItem, NULL);
         }
         
@@ -1165,20 +1166,20 @@ static void HaiouMassHelperInit(void) {
         Class chatVCCls = objc_getClass("_TtC7ZhengDu25ZDConversationController1");
         if (chatVCCls) {
             class_addMethod(chatVCCls, NSSelectorFromString(@"ho_onTapUnlockGroupMembers:"), (IMP)ho_onTapUnlockGroupMembers_imp, "v@:@");
-            orig_chat_viewDidAppear = (void *)method_getImplementation(class_getInstanceMethod(chatVCCls, @selector(viewDidAppear:)));
+            orig_chat_viewDidAppear = (__typeof__(orig_chat_viewDidAppear))method_getImplementation(class_getInstanceMethod(chatVCCls, @selector(viewDidAppear:)));
             SwizzleInstanceMethod(chatVCCls, @selector(viewDidAppear:), NSSelectorFromString(@"ho_chat_viewDidAppear:"), (IMP)hook_chat_viewDidAppear, NULL);
         }
         
         // 5. 挂载群模型 (ZDGroup) 与群成员模型 (ZDGroupMember)
         Class groupCls = objc_getClass("_TtC7ZhengDu7ZDGroup");
         if (groupCls) {
-            orig_group_init = (void *)method_getImplementation(class_getInstanceMethod(groupCls, @selector(init)));
+            orig_group_init = (__typeof__(orig_group_init))method_getImplementation(class_getInstanceMethod(groupCls, @selector(init)));
             SwizzleInstanceMethod(groupCls, @selector(init), NSSelectorFromString(@"ho_group_init"), (IMP)hook_group_init, NULL);
         }
         
         Class groupMemberCls = objc_getClass("_TtC7ZhengDu13ZDGroupMember");
         if (groupMemberCls) {
-            orig_groupMember_init = (void *)method_getImplementation(class_getInstanceMethod(groupMemberCls, @selector(init)));
+            orig_groupMember_init = (__typeof__(orig_groupMember_init))method_getImplementation(class_getInstanceMethod(groupMemberCls, @selector(init)));
             SwizzleInstanceMethod(groupMemberCls, @selector(init), NSSelectorFromString(@"ho_gm_init"), (IMP)hook_groupMember_init, NULL);
         }
     });
