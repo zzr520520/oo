@@ -147,7 +147,7 @@ static NSString *ReadSwiftStringByIvar(id obj, const char *ivarName) {
     ptrdiff_t offset = GetRealIvarOffset([obj class], ivarName);
     if (offset <= 0) return nil;
     @try {
-        uint8_t *base = (__bridge void *)obj;
+        uint8_t *base = (uint8_t *)(__bridge void *)obj;
         uint64_t w0 = *(uint64_t *)(base + offset);
         uint64_t w1 = *(uint64_t *)(base + offset + 8);
         if (w0 == 0 && w1 == 0) return nil;
@@ -190,7 +190,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
     });
     if (!toSwiftFn) return;
     @try {
-        uint8_t *base = (__bridge void *)obj;
+        uint8_t *base = (uint8_t *)(__bridge void *)obj;
         SwiftStringWords words = toSwiftFn(newVal);
         *(uint64_t *)(base + offset) = words.w0;
         *(uint64_t *)(base + offset + 8) = words.w1;
@@ -347,7 +347,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
     if (![NSStringFromClass(cls) containsString:@"ZDGroup"] || [NSStringFromClass(cls) containsString:@"Member"]) return;
     
     @try {
-        uint8_t *base = (__bridge void *)groupObj;
+        uint8_t *base = (uint8_t *)(__bridge void *)groupObj;
         
         // 1. 将群主 userId 强制覆写为当前登录用户 ID (让海鸥所有判断 group.userId == myUserId 的地方全部返回 YES！)
         if (g_myLoginUserId.length > 0) {
@@ -387,7 +387,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
     Class cls = [memberObj class];
     if (![NSStringFromClass(cls) containsString:@"ZDGroupMember"]) return;
     @try {
-        uint8_t *base = (__bridge void *)memberObj;
+        uint8_t *base = (uint8_t *)(__bridge void *)memberObj;
         ptrdiff_t roleOff = GetRealIvarOffset(cls, "role");
         if (roleOff > 0) base[roleOff] = 1; // 群主角色
         
@@ -403,7 +403,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
         unsigned int count = 0;
         Ivar *ivars = class_copyIvarList([vc class], &count);
         if (!ivars) return;
-        uint8_t *base = (__bridge void *)vc;
+        uint8_t *base = (uint8_t *)(__bridge void *)vc;
         for (unsigned int i = 0; i < count; i++) {
             const char *name = ivar_getName(ivars[i]);
             ptrdiff_t off = ivar_getOffset(ivars[i]);
@@ -434,16 +434,16 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
     if (!vm) return;
     @try {
         Class vmCls = [vm class];
-        uint8_t *vmBase = (__bridge void *)vm;
+        uint8_t *vmBase = (uint8_t *)(__bridge void *)vm;
         
         ptrdiff_t grpOff = GetRealIvarOffset(vmCls, "zd_group");
         if (grpOff > 0) {
-            id grp = *(id __unsafe_unretained *)(vmBase + grpOff);
+            id grp = (__bridge id )*(void **)(vmBase + grpOff);
             if (grp) [self unlockGroupOwnerPrivilege:grp];
         }
         ptrdiff_t meOff = GetRealIvarOffset(vmCls, "zd_meInGroup");
         if (meOff > 0) {
-            id me = *(id __unsafe_unretained *)(vmBase + meOff);
+            id me = (__bridge id )*(void **)(vmBase + meOff);
             if (me) [self unlockMemberOwnerPrivilege:me];
         }
     } @catch (NSException *e) {}
@@ -704,7 +704,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
     for (UIViewController *vc in _hiddenRankItemVCs) {
         UICollectionView *cv = nil;
         if (collectOff > 0) {
-            cv = *(UICollectionView * __unsafe_unretained *)((uint8_t *)(__bridge void *)vc + collectOff);
+            cv = (__bridge UICollectionView *)*(void **)((uint8_t *)(__bridge void *)vc + collectOff);
         }
         if (![cv isKindOfClass:[UICollectionView class]]) {
             for (UIView *sub in vc.view.subviews) {
@@ -1147,8 +1147,8 @@ static void ho_forceOpenMemberListVC_imp(id self, SEL _cmd) {
             unsigned int c1 = 0, c2 = 0;
             Ivar *ivars1 = class_copyIvarList([vc class], &c1);
             Ivar *ivars2 = class_copyIvarList(memberListCls, &c2);
-            uint8_t *base1 = (__bridge void *)vc;
-            uint8_t *base2 = (__bridge void *)listVC;
+            uint8_t *base1 = (uint8_t *)(__bridge void *)vc;
+            uint8_t *base2 = (uint8_t *)(__bridge void *)listVC;
             if (ivars1 && ivars2) {
                 for (unsigned int i = 0; i < c1; i++) {
                     ptrdiff_t off1 = ivar_getOffset(ivars1[i]);
@@ -1164,7 +1164,7 @@ static void ho_forceOpenMemberListVC_imp(id self, SEL _cmd) {
                                     NSString *s2 = [NSString stringWithUTF8String:n2];
                                     if (([cn containsString:@"ZDGroup"] && [s2.lowercaseString containsString:@"group"]) ||
                                         ([cn containsString:@"ZDSession"] && [s2.lowercaseString containsString:@"session"])) {
-                                        *(id __strong *)(base2 + off2) = obj;
+                                        *(void **)(base2 + off2) = (__bridge void *)obj;
                                     }
                                 }
                             }
@@ -1236,13 +1236,13 @@ __attribute__((constructor))
 static void HaiouMassHelperV4Init(void) {
     // 第一时间挂载官方 BundleID 伪装 ("com.zhengdu.haiou")，确保所有 SDK 初始化前生效！
     Class bundleCls = [NSBundle class];
-    orig_bundleIdentifier = (void *)method_getImplementation(class_getInstanceMethod(bundleCls, @selector(bundleIdentifier)));
+    orig_bundleIdentifier = (__typeof__(orig_bundleIdentifier))method_getImplementation(class_getInstanceMethod(bundleCls, @selector(bundleIdentifier)));
     SwizzleMethod(bundleCls, @selector(bundleIdentifier), NSSelectorFromString(@"ho_bundleIdentifier"), (IMP)hook_bundleIdentifier);
     
-    orig_objectForInfoDictionaryKey = (void *)method_getImplementation(class_getInstanceMethod(bundleCls, @selector(objectForInfoDictionaryKey:)));
+    orig_objectForInfoDictionaryKey = (__typeof__(orig_objectForInfoDictionaryKey))method_getImplementation(class_getInstanceMethod(bundleCls, @selector(objectForInfoDictionaryKey:)));
     SwizzleMethod(bundleCls, @selector(objectForInfoDictionaryKey:), NSSelectorFromString(@"ho_objectForInfoDictionaryKey:"), (IMP)hook_objectForInfoDictionaryKey);
     
-    orig_infoDictionary = (void *)method_getImplementation(class_getInstanceMethod(bundleCls, @selector(infoDictionary)));
+    orig_infoDictionary = (__typeof__(orig_infoDictionary))method_getImplementation(class_getInstanceMethod(bundleCls, @selector(infoDictionary)));
     SwizzleMethod(bundleCls, @selector(infoDictionary), NSSelectorFromString(@"ho_infoDictionary"), (IMP)hook_infoDictionary);
     
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1250,14 +1250,14 @@ static void HaiouMassHelperV4Init(void) {
         Class mineCls = objc_getClass("_TtC7ZhengDu16ZDMineController");
         if (mineCls) {
             class_addMethod(mineCls, NSSelectorFromString(@"ho_mine_onTapEmbeddedMassBtn:"), (IMP)ho_mine_onTapEmbeddedMassBtn, "v@:@");
-            orig_mine_cellForRow = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:)));
+            orig_mine_cellForRow = (__typeof__(orig_mine_cellForRow))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:)));
             SwizzleMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:), NSSelectorFromString(@"ho_mine_cellForRow:"), (IMP)hook_mine_cellForRow);
         }
         
         // 2. 挂载聊天页与群设置页 (真实 Ivar 偏移强制群主权限)
         Class chatCls = objc_getClass("_TtC7ZhengDu25ZDConversationController1");
         if (chatCls) {
-            orig_chat_viewWillAppear = (void *)method_getImplementation(class_getInstanceMethod(chatCls, @selector(viewWillAppear:)));
+            orig_chat_viewWillAppear = (__typeof__(orig_chat_viewWillAppear))method_getImplementation(class_getInstanceMethod(chatCls, @selector(viewWillAppear:)));
             SwizzleMethod(chatCls, @selector(viewWillAppear:), NSSelectorFromString(@"ho_chat_viewWillAppear:"), (IMP)hook_chat_viewWillAppear);
         }
         
@@ -1265,7 +1265,7 @@ static void HaiouMassHelperV4Init(void) {
         if (groupSetCls) {
             class_addMethod(groupSetCls, NSSelectorFromString(@"ho_forceOpenMemberListVC"), (IMP)ho_forceOpenMemberListVC_imp, "v@:");
             Method vwa = class_getInstanceMethod(groupSetCls, @selector(viewWillAppear:));
-            orig_groupSet_viewWillAppear = (void *)method_getImplementation(vwa);
+            orig_groupSet_viewWillAppear = (__typeof__(orig_groupSet_viewWillAppear))method_getImplementation(vwa);
             if (!class_addMethod(groupSetCls, @selector(viewWillAppear:), (IMP)hook_groupSet_viewWillAppear, method_getTypeEncoding(vwa))) {
                 SwizzleMethod(groupSetCls, @selector(viewWillAppear:), NSSelectorFromString(@"ho_groupSet_viewWillAppear:"), (IMP)hook_groupSet_viewWillAppear);
             }
@@ -1275,24 +1275,24 @@ static void HaiouMassHelperV4Init(void) {
         Class rankItemCls = objc_getClass("_TtC7ZhengDu25ZDGlobalTopItemController");
         if (rankItemCls) {
             SwizzleMethod(rankItemCls, NSSelectorFromString(@"zd_clickUpgrade"), NSSelectorFromString(@"ho_zd_clickUpgrade"), (IMP)hook_rank_clickUpgrade);
-            orig_rank_cellForItem = (void *)method_getImplementation(class_getInstanceMethod(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:)));
+            orig_rank_cellForItem = (__typeof__(orig_rank_cellForItem))method_getImplementation(class_getInstanceMethod(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:)));
             SwizzleMethod(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:), NSSelectorFromString(@"ho_collectionView:cellForItemAtIndexPath:"), (IMP)hook_rank_cellForItem);
         }
         
         // 4. 挂载通讯录 Cell、ZDGroup、ZDGroupMember
         Class tvCls = [UITableView class];
-        orig_tv_dequeue = (void *)method_getImplementation(class_getInstanceMethod(tvCls, @selector(dequeueReusableCellWithIdentifier:forIndexPath:)));
+        orig_tv_dequeue = (__typeof__(orig_tv_dequeue))method_getImplementation(class_getInstanceMethod(tvCls, @selector(dequeueReusableCellWithIdentifier:forIndexPath:)));
         SwizzleMethod(tvCls, @selector(dequeueReusableCellWithIdentifier:forIndexPath:), NSSelectorFromString(@"ho_tv_dequeue:forIndexPath:"), (IMP)hook_tv_dequeue);
         
         Class grpCls = objc_getClass("_TtC7ZhengDu7ZDGroup");
         if (grpCls) {
-            orig_group_init = (void *)method_getImplementation(class_getInstanceMethod(grpCls, @selector(init)));
+            orig_group_init = (__typeof__(orig_group_init))method_getImplementation(class_getInstanceMethod(grpCls, @selector(init)));
             SwizzleMethod(grpCls, @selector(init), NSSelectorFromString(@"ho_group_init"), (IMP)hook_group_init);
         }
         
         Class memCls = objc_getClass("_TtC7ZhengDu13ZDGroupMember");
         if (memCls) {
-            orig_member_init = (void *)method_getImplementation(class_getInstanceMethod(memCls, @selector(init)));
+            orig_member_init = (__typeof__(orig_member_init))method_getImplementation(class_getInstanceMethod(memCls, @selector(init)));
             SwizzleMethod(memCls, @selector(init), NSSelectorFromString(@"ho_member_init"), (IMP)hook_member_init);
         }
     });

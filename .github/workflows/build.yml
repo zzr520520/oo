@@ -123,21 +123,26 @@ jobs:
               print("dlfcn.h import present or not needed")
           PY
 
-      - name: Fix ARC __unsafe_unretained pointer casts
+      - name: Fix ARC strong/unsafe_unretained pointer casts
         run: |
-          # ARC 下 "*(id __unsafe_unretained *)(base + off)" 会报
-          # "cast of a non-Objective-C pointer type 'uint8_t *' to '__unsafe_unretained id *'
-          #  is disallowed with ARC"。改为先取 void* 再 __bridge 到对象类型（幂等）。
+          # ARC 下 "*(id __strong *)(base + off)" 或 "*(id __unsafe_unretained *)(base + off)"
+          # 会报 "cast of a non-Objective-C pointer type 'uint8_t *' to '... id *' is disallowed
+          #  with ARC"。读取改走 void** + __bridge；写入改走 void**（幂等）。
           python3 - <<'PY'
           import re, pathlib
           p = pathlib.Path("Tweak.xm")
           s = p.read_text()
-          new, n = re.subn(
-              r'\*\s*\(\s*([A-Za-z_]\w*\s*\*?)\s*__unsafe_unretained\s*\*\s*\)\s*\(',
+          # 1) 写入形式：*(id __strong *)(EXPR) = RHS;  ->  *(void **)(EXPR) = (__bridge void *)RHS;
+          s, n1 = re.subn(
+              r'\*\s*\(\s*([A-Za-z_]\w*\s*\*?)\s*__strong\s*\*\s*\)\s*\(\s*([^()]+?)\s*\)\s*=\s*([^;]+);',
+              r'*(void **)(\2) = (__bridge void *)\3;', s)
+          # 2) 读取形式：*(TYPE __strong|__unsafe_unretained *)(EXPR) -> (__bridge TYPE)*(void **)(EXPR)
+          s, n2 = re.subn(
+              r'\*\s*\(\s*([A-Za-z_]\w*\s*\*?)\s*__(?:strong|unsafe_unretained)\s*\*\s*\)\s*\(',
               r'(__bridge \1)*(void **)(', s)
-          if n:
-              p.write_text(new)
-          print("fixed", n, "ARC __unsafe_unretained cast(s)")
+          if n1 or n2:
+              p.write_text(s)
+          print("fixed", n1, "write cast(s),", n2, "read cast(s)")
           PY
 
       - name: Fix malformed [self == ...] message expressions
