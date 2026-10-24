@@ -1,10 +1,10 @@
 //
 //  HaiouMassHelper.m
-//  海鸥 3.2.9 最终修复版 v4.1
-//  修复内容：
-//  1. 找回“群发助手”在“我的”页面（ZDMineController）的入口显示。
+//  海鸥 3.2.9 终极完整版 v4.2
+//  包含：
+//  1. “我的”页面（ZDMineController）“群发助手”入口无缝嵌入。
 //  2. 严格过滤长ID（如18757646464646），确保点击加好友填入的是纯净标准海鸥号。
-//  3. 在群发助手内内置独立按钮：“👥 一键抓取当前群成员” 与 “🏆 一键抓取排行榜全量”，点击即刻自动追加，告别200人限制。
+//  3. 内置独立接口：“👥 一键抓取当前群全部成员” 与 “🏆 自动翻页抓取排行榜全量”，告别200人限制。
 //  4. 模拟官方 bundleIdentifier 防多开检测。
 //
 
@@ -18,7 +18,7 @@
 static NSString *(*orig_nsbundle_bundleIdentifier)(id, SEL);
 static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
     NSString *orig = orig_nsbundle_bundleIdentifier(self, _cmd);
-    if ([orig containsString:@"zhengdu"] || [orig containsString:@"haiou"] || (self == [NSBundle mainBundle])) {
+    if ([orig containsString:@"zhengdu"] || [orig containsString:@"haiou"] || [self == [NSBundle mainBundle]]) {
         return @"com.zhengdu.haiou";
     }
     return orig;
@@ -110,7 +110,6 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
     NSArray *keys = [_collectedUsersMap allKeys];
     for (NSString *k in keys) {
         HOModelItem *item = _collectedUsersMap[k];
-        // 严格剔除长数字ID（防止把如18757646464646当成账号）或等级昵称
         if (item.account.length >= 12 || [item.name containsString:@"级"] || item.name.length == 0) {
             [_collectedUsersMap removeObjectForKey:k];
         }
@@ -131,9 +130,9 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
         NSData *fData = [NSKeyedArchiver archivedDataWithRootObject:_contactFriendsMap requiringSecureCoding:NO error:nil];
         NSData *gData = [NSKeyedArchiver archivedDataWithRootObject:_joinedGroupsMap requiringSecureCoding:NO error:nil];
         NSData *cData = [NSKeyedArchiver archivedDataWithRootObject:_collectedUsersMap requiringSecureCoding:NO error:nil];
-        if (fData) [ud setObject:fData forKey:@"HO_Cache_Friends_v4_1"];
-        if (gData) [ud setObject:gData forKey:@"HO_Cache_Groups_v4_1"];
-        if (cData) [ud setObject:cData forKey:@"HO_Cache_Collected_v4_1"];
+        if (fData) [ud setObject:fData forKey:@"HO_Cache_Friends_v4_2"];
+        if (gData) [ud setObject:gData forKey:@"HO_Cache_Groups_v4_2"];
+        if (cData) [ud setObject:cData forKey:@"HO_Cache_Collected_v4_2"];
     } @catch (NSException *e) {}
     [ud synchronize];
 }
@@ -141,9 +140,9 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
 - (void)loadCacheFromDisk {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     @try {
-        NSData *fData = [ud objectForKey:@"HO_Cache_Friends_v4_1"];
-        NSData *gData = [ud objectForKey:@"HO_Cache_Groups_v4_1"];
-        NSData *cData = [ud objectForKey:@"HO_Cache_Collected_v4_1"];
+        NSData *fData = [ud objectForKey:@"HO_Cache_Friends_v4_2"];
+        NSData *gData = [ud objectForKey:@"HO_Cache_Groups_v4_2"];
+        NSData *cData = [ud objectForKey:@"HO_Cache_Collected_v4_2"];
         if (fData) {
             NSDictionary *d = [NSKeyedUnarchiver unarchiveObjectWithData:fData];
             if ([d isKindOfClass:[NSDictionary class]]) [_contactFriendsMap addEntriesFromDictionary:d];
@@ -166,9 +165,9 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
     if (account.length >= 3 && account.length < 12) {
         validAcc = account;
     } else if (userId.length >= 3 && userId.length < 12) {
-        validAcc = userId; // 兜底
+        validAcc = userId;
     }
-    if (!validAcc || validAcc.length >= 12) return; // 严格拒绝长ID
+    if (!validAcc || validAcc.length >= 12) return;
     if (nickName.length == 0 || [nickName containsString:@"级"]) return;
     
     HOModelItem *item = _collectedUsersMap[validAcc] ?: [[HOModelItem alloc] init];
@@ -197,14 +196,12 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
     }
 }
 
-// 后台自动模拟分页抓取排行榜全量数据
 - (void)triggerBatchGrabRankWithCompletion:(void(^)(NSInteger count))completion {
     UIWindow *win = [UIApplication sharedApplication].keyWindow;
     UIViewController *topVC = win.rootViewController;
     while (topVC.presentedViewController) topVC = topVC.presentedViewController;
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // 尝试在当前视图栈中寻找 ZDGlobalTopItemController
         __block id targetRankVC = nil;
         void (^findRank)(UIViewController *) = ^(UIViewController *vc){
             if ([NSStringFromClass([vc class]) containsString:@"ZDGlobalTopItemController"]) {
@@ -220,10 +217,10 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
             return;
         }
         
-        uint8_t *base = (uint8_t *)(__bridge void *)targetRankVC;
+        uint8_t *base = (__bridge void *)targetRankVC;
         NSInteger *pagePtr = (NSInteger *)(base + 0x70);
         NSInteger *sizePtr = (NSInteger *)(base + 0x78);
-        UICollectionView *collect = (__bridge UICollectionView *)*(void **)(base + 0x88);
+        UICollectionView *collect = *(UICollectionView * __unsafe_unretained *)(base + 0x88);
         
         if (sizePtr) *sizePtr = 500;
         
@@ -320,7 +317,6 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
     [self.view addSubview:massBtn];
     topY += 48;
     
-    // 独立抓取接口区
     CGFloat bW = (self.view.bounds.size.width - 40) / 2.0;
     UIButton *grabGroupBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     grabGroupBtn.frame = CGRectMake(15, topY, bW, 36);
@@ -379,19 +375,19 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
     
     NSString *cls = NSStringFromClass([topVC class]);
     if ([cls containsString:@"ZDConversationController1"] || [cls containsString:@"ZDConversationGroupSetController"]) {
-        uint8_t *base = (uint8_t *)(__bridge void *)topVC;
+        uint8_t *base = (__bridge void *)topVC;
         @try {
-            id groupInfo = (__bridge id)*(void **)(base + 0x150);
-            if (!groupInfo) groupInfo = (__bridge id)*(void **)(base + 0x140);
+            id groupInfo = *(id __unsafe_unretained *)(base + 0x150);
+            if (!groupInfo) groupInfo = *(id __unsafe_unretained *)(base + 0x140);
             if (groupInfo) {
-                uint8_t *gBase = (uint8_t *)(__bridge void *)groupInfo;
-                id members = (__bridge id)*(void **)(gBase + 0x1f0);
+                uint8_t *gBase = (__bridge void *)groupInfo;
+                id members = *(id __unsafe_unretained *)(gBase + 0x1f0);
                 if ([members isKindOfClass:[NSArray class]]) {
                     for (id m in (NSArray *)members) {
                         NSString *uid = nil, *acc = nil, *nick = nil, *port = nil;
-                        @try { uid = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"userId")); } @catch(NSException *e){}
-                        @try { acc = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"account")); } @catch(NSException *e){}
-                        @try { nick = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"nickName")); } @catch(NSException *e){}
+                        @try { uid = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"userId")); } @catch(e){}
+                        @try { acc = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"account")); } @catch(e){}
+                        @try { nick = ((id(*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"nickName")); } @catch(e){}
                         [[HOMassEngine shared] harvestMemberWithUserId:uid account:acc nickName:nick portrait:port source:@"群聊抓取"];
                     }
                 }
@@ -399,13 +395,17 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
         } @catch (NSException *e) {}
     }
     [self reloadTabData];
-    _statusLabel.text = [NSString stringWithFormat:@"✅ 群成员抓取成功！采集池总人数: %lu", (unsigned long)[HOMassEngine shared].collectedUsersMap.count];
+    if (_statusLabel) {
+        _statusLabel.text = [NSString stringWithFormat:@"✅ 群成员抓取成功！采集池总人数: %lu", (unsigned long)[HOMassEngine shared].collectedUsersMap.count];
+    }
 }
 
 - (void)actionGrabRank {
     [[HOMassEngine shared] triggerBatchGrabRankWithCompletion:^(NSInteger count) {
         [self reloadTabData];
-        self.statusLabel.text = [NSString stringWithFormat:@"🏆 排行榜全量抓取完毕！累计采集: %ld人", (long)count];
+        if (self.statusLabel) {
+            self.statusLabel.text = [NSString stringWithFormat:@"🏆 排行榜全量抓取完毕！累计采集: %ld人", (long)count];
+        }
     }];
 }
 
@@ -420,23 +420,25 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
         _currentList = [eng.collectedUsersMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
             return a.collectSeq > b.collectSeq ? NSOrderedAscending : NSOrderedDescending;
         }];
-        _statusLabel.text = [NSString stringWithFormat:@"👉 点击任意一行直达官方添加好友页 (共 %lu 人)", (unsigned long)_currentList.count];
+        if (_statusLabel) _statusLabel.text = [NSString stringWithFormat:@"👉 点击任意一行直达官方添加好友页 (共 %lu 人)", (unsigned long)_currentList.count];
     } else if (_tabSegment.selectedSegmentIndex == 1) {
         _currentList = [eng.joinedGroupsMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
             return [a.name compare:b.name];
         }];
-        _statusLabel.text = [NSString stringWithFormat:@"【我的群聊】共 %lu 个群", (unsigned long)_currentList.count];
+        if (_statusLabel) _statusLabel.text = [NSString stringWithFormat:@"【我的群聊】共 %lu 个群", (unsigned long)_currentList.count];
     } else {
         _currentList = [eng.contactFriendsMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
             return [a.name compare:b.name];
         }];
-        _statusLabel.text = [NSString stringWithFormat:@"【通讯录好友】共 %lu 人", (unsigned long)_currentList.count];
+        if (_statusLabel) _statusLabel.text = [NSString stringWithFormat:@"【通讯录好友】共 %lu 人", (unsigned long)_currentList.count];
     }
-    [_tableView reloadData];
+    if (_tableView) {
+        [_tableView reloadData];
+    }
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return _currentList.count;
+    return _currentList ? _currentList.count : 0;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -446,19 +448,30 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cid];
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
+    
+    if (!_currentList || indexPath.row >= _currentList.count) {
+        cell.textLabel.text = @"加载中...";
+        cell.detailTextLabel.text = @"";
+        return cell;
+    }
+    
     HOModelItem *item = _currentList[indexPath.row];
-    cell.textLabel.text = [NSString stringWithFormat:@"%ld. %@", (long)(indexPath.row + 1), item.name];
+    cell.textLabel.text = [NSString stringWithFormat:@"%ld. %@", (long)(indexPath.row + 1), item.name ?: @"未知"];
     cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
-    cell.detailTextLabel.text = [NSString stringWithFormat:@"纯海鸥号: %@  |  来源: %@", item.account, item.source];
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"纯海鸥号: %@  |  来源: %@", item.account ?: @"", item.source ?: @""];
     cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     return cell;
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    HOModelItem *item = _currentList[indexPath.row];
     
-    [UIPasteboard generalPasteboard].string = item.account;
+    if (!_currentList || indexPath.row >= _currentList.count) return;
+    
+    HOModelItem *item = _currentList[indexPath.row];
+    if (item.account.length > 0) {
+        [UIPasteboard generalPasteboard].string = item.account;
+    }
     
     Class addCls = objc_getClass("_TtC7ZhengDu28ZDAddFriendOrGroupController");
     if (addCls && self.navigationController) {
@@ -470,7 +483,7 @@ static NSString *hook_nsbundle_bundleIdentifier(id self, SEL _cmd) {
 
 @end
 
-#pragma mark - ==================== 4. Runtime Hook 挂载（补全“我的”页面入口插桩） ====================
+#pragma mark - ==================== 4. Runtime Hook 挂载区 ====================
 
 static void SwizzleInstanceMethod(Class cls, SEL origSel, SEL swizSel, IMP newImp, const char *types) {
     if (!cls) return;
@@ -511,7 +524,7 @@ static UITableViewCell *hook_mine_cellForRowAtIndexPath(id self, SEL _cmd, UITab
         if (origRows > 0) {
             NSInteger insertRow = MIN([HOMassEngine shared].haiouAssistantRow + 1, origRows);
             if (indexPath.row == insertRow) {
-                static NSString *kCellId = @"ZD_HOMassHelperEntryCell_v4_1";
+                static NSString *kCellId = @"ZD_HOMassHelperEntryCell_v4_2";
                 UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:kCellId];
                 if (!cell) {
                     cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:kCellId];
@@ -560,29 +573,29 @@ static void hook_mine_didSelectRowAtIndexPath(id self, SEL _cmd, UITableView *ta
 #pragma mark - ==================== Dylib 初始化入口 ====================
 
 __attribute__((constructor))
-static void HaiouMassHelperInitV41(void) {
+static void HaiouMassHelperInitV42(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         // 1. 挂载 BundleID 多开防检测
         Class bundleCls = [NSBundle class];
         SEL bSel = @selector(bundleIdentifier);
-        orig_nsbundle_bundleIdentifier = (__typeof__(orig_nsbundle_bundleIdentifier))method_getImplementation(class_getInstanceMethod(bundleCls, bSel));
+        orig_nsbundle_bundleIdentifier = (void *)method_getImplementation(class_getInstanceMethod(bundleCls, bSel));
         Method origM = class_getInstanceMethod(bundleCls, bSel);
         class_addMethod(bundleCls, NSSelectorFromString(@"ho_bundleIdentifier"), (IMP)hook_nsbundle_bundleIdentifier, method_getTypeEncoding(origM));
         method_exchangeImplementations(origM, class_getInstanceMethod(bundleCls, NSSelectorFromString(@"ho_bundleIdentifier")));
         
-        // 2. 挂载“我的”页面（ZDMineController）“群发助手”入口显示
+        // 2. 挂载“我的”页面（ZDMineController）入口
         Class mineCls = objc_getClass("_TtC7ZhengDu16ZDMineController");
         if (mineCls) {
-            orig_mine_numberOfRowsInSection = (__typeof__(orig_mine_numberOfRowsInSection))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:)));
+            orig_mine_numberOfRowsInSection = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:numberOfRowsInSection:), NSSelectorFromString(@"ho_tableView:numberOfRowsInSection:"), (IMP)hook_mine_numberOfRowsInSection, NULL);
             
-            orig_mine_heightForRowAtIndexPath = (__typeof__(orig_mine_heightForRowAtIndexPath))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:heightForRowAtIndexPath:)));
+            orig_mine_heightForRowAtIndexPath = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:heightForRowAtIndexPath:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:heightForRowAtIndexPath:), NSSelectorFromString(@"ho_tableView:heightForRowAtIndexPath:"), (IMP)hook_mine_heightForRowAtIndexPath, NULL);
             
-            orig_mine_cellForRowAtIndexPath = (__typeof__(orig_mine_cellForRowAtIndexPath))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:)));
+            orig_mine_cellForRowAtIndexPath = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:cellForRowAtIndexPath:), NSSelectorFromString(@"ho_tableView:cellForRowAtIndexPath:"), (IMP)hook_mine_cellForRowAtIndexPath, NULL);
             
-            orig_mine_didSelectRowAtIndexPath = (__typeof__(orig_mine_didSelectRowAtIndexPath))method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:)));
+            orig_mine_didSelectRowAtIndexPath = (void *)method_getImplementation(class_getInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:)));
             SwizzleInstanceMethod(mineCls, @selector(tableView:didSelectRowAtIndexPath:), NSSelectorFromString(@"ho_tableView:didSelectRowAtIndexPath:"), (IMP)hook_mine_didSelectRowAtIndexPath, NULL);
         }
     });
