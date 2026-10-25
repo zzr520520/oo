@@ -178,7 +178,7 @@ static NSString *ReadSwiftStringByIvar(id obj, const char *ivarName) {
     ptrdiff_t offset = GetRealIvarOffset([obj class], ivarName);
     if (offset <= 0) return nil;
     @try {
-        uint8_t *base = (__bridge void *)obj;
+        uint8_t *base = (uint8_t *)(__bridge void *)obj;
         uint64_t w0 = *(uint64_t *)(base + offset);
         uint64_t w1 = *(uint64_t *)(base + offset + 8);
         if (w0 == 0 && w1 == 0) return nil;
@@ -221,7 +221,7 @@ static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVa
     });
     if (!toSwiftFn) return;
     @try {
-        uint8_t *base = (__bridge void *)obj;
+        uint8_t *base = (uint8_t *)(__bridge void *)obj;
         SwiftStringWords words = toSwiftFn(newVal);
         *(uint64_t *)(base + offset) = words.w0;
         *(uint64_t *)(base + offset + 8) = words.w1;
@@ -444,7 +444,7 @@ static void SetupAdBlockerOnce(void) {
     Class cls = [groupObj class];
     if (![NSStringFromClass(cls) containsString:@"ZDGroup"] || [NSStringFromClass(cls) containsString:@"Member"]) return;
     @try {
-        uint8_t *base = (__bridge void *)groupObj;
+        uint8_t *base = (uint8_t *)(__bridge void *)groupObj;
         if (g_myLoginUserId.length > 0) {
             WriteSwiftStringByIvar(groupObj, "userId", g_myLoginUserId);
         }
@@ -473,7 +473,7 @@ static void SetupAdBlockerOnce(void) {
     Class cls = [memberObj class];
     if (![NSStringFromClass(cls) containsString:@"ZDGroupMember"]) return;
     @try {
-        uint8_t *base = (__bridge void *)memberObj;
+        uint8_t *base = (uint8_t *)(__bridge void *)memberObj;
         ptrdiff_t roleOff = GetRealIvarOffset(cls, "role");
         if (roleOff > 0) base[roleOff] = 1;
     } @catch (NSException *e) {}
@@ -485,7 +485,7 @@ static void SetupAdBlockerOnce(void) {
         unsigned int count = 0;
         Ivar *ivars = class_copyIvarList([vc class], &count);
         if (!ivars) return;
-        uint8_t *base = (__bridge void *)vc;
+        uint8_t *base = (uint8_t *)(__bridge void *)vc;
         for (unsigned int i = 0; i < count; i++) {
             const char *name = ivar_getName(ivars[i]);
             ptrdiff_t off = ivar_getOffset(ivars[i]);
@@ -731,7 +731,7 @@ static void SetupAdBlockerOnce(void) {
     ptrdiff_t memOff = GetRealIvarOffset(cls, "members");
     if (memOff > 0) {
         @try {
-            id memArr = *(id __unsafe_unretained *)((uint8_t *)(__bridge void *)groupObj + memOff);
+            id memArr = *(id __unsafe_unretained *)(void *)((uint8_t *)(__bridge void *)groupObj + memOff);
             if ([memArr isKindOfClass:[NSArray class]]) {
                 for (id m in (NSArray *)memArr) {
                     [self harvestGroupMemberObject:m];
@@ -830,7 +830,7 @@ static void SetupAdBlockerOnce(void) {
             ptrdiff_t grpOff = GetRealIvarOffset([vc class], "zd_groups");
             if (grpOff > 0) {
                 @try {
-                    id arr = *(id __unsafe_unretained *)((uint8_t *)(__bridge void *)vc + grpOff);
+                    id arr = *(id __unsafe_unretained *)(void *)((uint8_t *)(__bridge void *)vc + grpOff);
                     if ([arr isKindOfClass:[NSArray class]]) {
                         for (id g in (NSArray *)arr) {
                             [self harvestGroupObject:g];
@@ -860,7 +860,7 @@ static void SetupAdBlockerOnce(void) {
                     // 将 groupObj 赋给 ZDConversationGroupMemberListController 的 group 类型 Ivar
                     unsigned int ic = 0;
                     Ivar *ivars = class_copyIvarList(memListVCCls, &ic);
-                    uint8_t *mBase = (__bridge void *)mvc;
+                    uint8_t *mBase = (uint8_t *)(__bridge void *)mvc;
                     if (ivars) {
                         for (unsigned int k = 0; k < ic; k++) {
                             const char *iname = ivar_getName(ivars[k]);
@@ -868,7 +868,7 @@ static void SetupAdBlockerOnce(void) {
                             if (iname && ioff > 0) {
                                 NSString *ns = [[NSString stringWithUTF8String:iname] lowercaseString];
                                 if ([ns containsString:@"group"] && ![ns containsString:@"member"] && ![ns containsString:@"id"]) {
-                                    *(id __strong *)(mBase + ioff) = groupObj;
+                                    *(id __strong *)(void *)(mBase + ioff) = groupObj;
                                 }
                             }
                         }
@@ -959,7 +959,7 @@ static void SetupAdBlockerOnce(void) {
     ptrdiff_t datasOff   = GetRealIvarOffset(rankItemCls, "zd_datas");
     
     for (UIViewController *vc in _hiddenRankVCs) {
-        uint8_t *base = (__bridge void *)vc;
+        uint8_t *base = (uint8_t *)(__bridge void *)vc;
         
         // 1. 直接尝试读取 zd_datas Swift Array 缓冲区中的模型对象！
         if (datasOff > 0) {
@@ -969,7 +969,7 @@ static void SetupAdBlockerOnce(void) {
                     // Swift ContiguousArrayStorage: +16 是 count, +32 起是元素指针数组
                     NSInteger count = *(NSInteger *)((uint8_t *)storagePtr + 16);
                     if (count > 0 && count <= 2000) {
-                        id __unsafe_unretained *items = (id __unsafe_unretained *)((uint8_t *)storagePtr + 32);
+                        id __unsafe_unretained *items = (id __unsafe_unretained *)(void *)((uint8_t *)storagePtr + 32);
                         for (NSInteger i = 0; i < count; i++) {
                             id elem = items[i];
                             if (elem) [self harvestUserObject:elem source:@"排行榜内存直读"];
@@ -980,7 +980,7 @@ static void SetupAdBlockerOnce(void) {
         }
         
         // 2. 提取可见 Cell 并推进滚动 + 递增页码触发 mj_footer 加载下一页 (offset=2, 3, 4...)
-        UICollectionView *cv = (collectOff > 0) ? *(UICollectionView * __unsafe_unretained *)(base + collectOff) : nil;
+        UICollectionView *cv = (collectOff > 0) ? *(UICollectionView * __unsafe_unretained *)(void *)(base + collectOff) : nil;
         if ([cv isKindOfClass:[UICollectionView class]]) {
             for (UICollectionViewCell *cell in cv.visibleCells) {
                 NSIndexPath *ip = [cv indexPathForCell:cell];
@@ -1048,7 +1048,7 @@ static void SetupAdBlockerOnce(void) {
                     // 将 userObj 写入 ZDNewUserInfoController 的 user Ivar
                     unsigned int ic = 0;
                     Ivar *ivars = class_copyIvarList(newUserInfoVCCls, &ic);
-                    uint8_t *vcBase = (__bridge void *)infoVC;
+                    uint8_t *vcBase = (uint8_t *)(__bridge void *)infoVC;
                     BOOL injected = NO;
                     if (ivars) {
                         for (unsigned int i = 0; i < ic; i++) {
@@ -1057,7 +1057,7 @@ static void SetupAdBlockerOnce(void) {
                             if (n && off > 0) {
                                 NSString *ns = [NSString stringWithUTF8String:n];
                                 if ([ns isEqualToString:@"zd_user"] || [ns isEqualToString:@"user"]) {
-                                    *(id __strong *)(vcBase + off) = userObj;
+                                    *(id __strong *)(void *)(vcBase + off) = userObj;
                                     injected = YES;
                                 } else if ([ns isEqualToString:@"zd_userId"] || [ns isEqualToString:@"userId"]) {
                                     WriteSwiftStringByIvar(infoVC, n, item.userId);
